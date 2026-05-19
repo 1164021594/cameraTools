@@ -1,0 +1,19 @@
+camera:
+  left_index: 0
+  right_index: 1
+  width: 640
+  height: 480
+  fps: 15
+  single_mode: false
+  backend: AUTO
+  pixel_format: MJPG
+aruco:
+  dictionary: DICT_4X4_50
+  markers_x: 5
+  markers_y: 7
+  marker_length_m: 0.03
+  marker_separation_m: 0.01
+capture:
+  output_dir: data/images
+output:
+  dir: data/output
