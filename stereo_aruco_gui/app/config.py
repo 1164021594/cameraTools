@@ -29,6 +29,7 @@ class ArucoConfig:
     markers_y: int = 7
     marker_length_m: float = 0.03
     marker_separation_m: float = 0.01
+    board_mirror_x: bool = False
 
 
 @dataclass
@@ -84,6 +85,7 @@ def load_config(path: Path | str = CONFIG_PATH) -> AppConfig:
             markers_y=int(aruco.get("markers_y", 7)),
             marker_length_m=float(aruco.get("marker_length_m", 0.03)),
             marker_separation_m=float(aruco.get("marker_separation_m", 0.01)),
+            board_mirror_x=bool(aruco.get("board_mirror_x", False)),
         ),
         capture=CaptureConfig(output_dir=str(capture.get("output_dir", "data/images"))),
         output=OutputConfig(dir=str(output.get("dir", "data/output"))),

@@ -5,14 +5,15 @@ camera:
   height: 480
   fps: 15
   single_mode: false
-  backend: AUTO
+  backend: MSMF
   pixel_format: MJPG
 aruco:
-  dictionary: DICT_4X4_50
-  markers_x: 5
-  markers_y: 7
-  marker_length_m: 0.03
-  marker_separation_m: 0.01
+  dictionary: DICT_APRILTAG_36h11
+  markers_x: 7
+  markers_y: 5
+  marker_length_m: 0.08
+  marker_separation_m: 0.024
+  board_mirror_x: true
 capture:
   output_dir: data/images
 output:

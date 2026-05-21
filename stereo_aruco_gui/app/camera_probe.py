@@ -11,6 +11,7 @@ BACKENDS: list[tuple[str, int]] = [
     ("MSMF", cv2.CAP_MSMF),
     ("DEFAULT", cv2.CAP_ANY),
 ]
+DEFAULT_SCAN_BACKENDS: list[tuple[str, int]] = [("DSHOW", cv2.CAP_DSHOW)]
 
 
 @dataclass(frozen=True)
@@ -52,7 +53,7 @@ def probe_camera(index: int, backend: int, width: int, height: int, fps: int) ->
 
 def scan_camera_indices(
     indexes: list[int] | range = range(6),
-    backends: list[tuple[str, int]] = BACKENDS,
+    backends: list[tuple[str, int]] = DEFAULT_SCAN_BACKENDS,
     width: int = 640,
     height: int = 480,
     fps: int = 30,

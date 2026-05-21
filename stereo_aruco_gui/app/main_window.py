@@ -2,10 +2,12 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import cv2
 import numpy as np
 from PySide6.QtCore import QTimer, Qt, QUrl
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
+    QApplication,
     QCheckBox,
     QComboBox,
     QDoubleSpinBox,
@@ -25,12 +27,29 @@ from PySide6.QtWidgets import (
 )
 
 from stereo_aruco_gui.app.aruco_board import ARUCO_DICTIONARIES, detect_markers, draw_detection
-from stereo_aruco_gui.app.calibration import StereoCalibrationResult, calibrate_from_pairs
+from stereo_aruco_gui.app.calibration import (
+    CalibrationDatasetReport,
+    CalibrationPairPreview,
+    StereoCalibrationResult,
+    analyze_calibration_pairs,
+    calibrate_from_pairs,
+    calibration_quality_label,
+)
 from stereo_aruco_gui.app.camera_probe import scan_camera_indices
 from stereo_aruco_gui.app.camera_worker import BACKEND_MAP, PIXEL_FORMATS, SingleCameraWorker, preview_copy
 from stereo_aruco_gui.app.config import AppConfig, ArucoConfig, CameraConfig, save_config
 from stereo_aruco_gui.app.image_view import ImageView
-from stereo_aruco_gui.app.rectification import Rectifier, compute_disparity, disparity_preview, distance_at, draw_horizontal_guides
+from stereo_aruco_gui.app.original_image_dialog import OriginalImageDialog
+from stereo_aruco_gui.app.rectification import (
+    DisparityConfig,
+    Rectifier,
+    compute_disparity,
+    disparity_preview,
+    draw_depth_roi,
+    distance_at,
+    filtered_disparity_preview,
+    draw_horizontal_guides,
+)
 from stereo_aruco_gui.app.storage import delete_last_image_pair, list_image_pairs, load_calibration_npz, save_image_pair
 from stereo_aruco_gui.app.ui_state import camera_selection_warning, pair_count_text, view_mode_enabled
 
@@ -40,13 +59,33 @@ RESOLUTION_OPTIONS = (
     (640, 480),
     (800, 600),
     (1024, 768),
-    (1280, 720),
     (1280, 960),
     (1920, 1080),
     (2592, 1944),
 )
+DEFAULT_RESOLUTION = (1280, 960)
 
 VIEW_MODES = ("Live Preview", "ArUco Detection", "Rectified Preview", "Depth / Distance")
+BACKEND_OPTIONS = ("AUTO", *BACKEND_MAP.keys())
+DEPTH_PRESETS = {
+    "Balanced": DisparityConfig(),
+    "Near": DisparityConfig(
+        num_disparities=256,
+        block_size=5,
+        uniqueness_ratio=5,
+        speckle_window_size=0,
+        speckle_range=2,
+        disp12_max_diff=-1,
+    ),
+    "Far / Fast": DisparityConfig(
+        num_disparities=128,
+        block_size=5,
+        uniqueness_ratio=10,
+        speckle_window_size=100,
+        speckle_range=2,
+        disp12_max_diff=1,
+    ),
+}
 
 
 def resolution_label(width: int, height: int) -> str:
@@ -66,8 +105,16 @@ class MainWindow(QMainWindow):
         self.right_worker: SingleCameraWorker | None = None
         self.latest_left: np.ndarray | None = None
         self.latest_right: np.ndarray | None = None
+        self.frozen_left: np.ndarray | None = None
+        self.frozen_right: np.ndarray | None = None
+        self._freeze_enabled = False
         self.rectifier: Rectifier | None = None
         self.latest_disparity: np.ndarray | None = None
+        self._opening_labels: set[str] = set()
+        self._original_dialogs: list[OriginalImageDialog] = []
+        self._last_calibration_preview: CalibrationPairPreview | None = None
+        self._calibration_review_previews: list[CalibrationPairPreview] = []
+        self._updating_calibration_pair_select = False
         self.preview_timer = QTimer(self)
         self.preview_timer.setInterval(100)
         self.preview_timer.timeout.connect(self._refresh_preview)
@@ -76,6 +123,11 @@ class MainWindow(QMainWindow):
         self.resize(1400, 820)
         self._build_ui()
         self._refresh_pair_count()
+
+    def _any_camera_worker_running(self) -> bool:
+        return (self.left_worker is not None and self.left_worker.isRunning()) or (
+            self.right_worker is not None and self.right_worker.isRunning()
+        )
 
     def closeEvent(self, event) -> None:  # noqa: ANN001
         self._stop_cameras("window close")
@@ -95,7 +147,11 @@ class MainWindow(QMainWindow):
         controls = QVBoxLayout(sidebar)
         controls.addWidget(self._camera_group())
         controls.addWidget(self._capture_group())
-        controls.addWidget(self._calibration_group())
+        self.calibration_group = self._calibration_group()
+        self.depth_group = self._depth_group()
+        self.depth_group.hide()
+        controls.addWidget(self.calibration_group)
+        controls.addWidget(self.depth_group)
         controls.addWidget(self._ranging_group())
         controls.addWidget(self._diagnostics_group())
         controls.addStretch(1)
@@ -113,18 +169,41 @@ class MainWindow(QMainWindow):
         self.view_mode.currentTextChanged.connect(self._view_mode_changed)
         preview_header.addWidget(QLabel("View"))
         preview_header.addWidget(self.view_mode)
+        self.prev_calibration_pair_button = QPushButton("Prev Pair")
+        self.prev_calibration_pair_button.clicked.connect(self._show_previous_calibration_pair)
+        self.next_calibration_pair_button = QPushButton("Next Pair")
+        self.next_calibration_pair_button.clicked.connect(self._show_next_calibration_pair)
+        self.calibration_pair_select = QComboBox()
+        self.calibration_pair_select.setMinimumWidth(190)
+        self.calibration_pair_select.currentIndexChanged.connect(self._calibration_pair_selected)
+        preview_header.addWidget(QLabel("Calibration Pair"))
+        preview_header.addWidget(self.prev_calibration_pair_button)
+        preview_header.addWidget(self.calibration_pair_select)
+        preview_header.addWidget(self.next_calibration_pair_button)
+        self._set_calibration_review_enabled(False)
         preview_header.addStretch(1)
         self.preview_info = QLabel("Live Preview")
         preview_header.addWidget(self.preview_info)
         preview_panel_layout.addLayout(preview_header)
 
         preview_layout = QGridLayout()
+        preview_layout.setContentsMargins(0, 0, 0, 0)
+        preview_layout.setHorizontalSpacing(8)
+        preview_layout.setVerticalSpacing(1)
+        preview_layout.setColumnStretch(0, 1)
+        preview_layout.setColumnStretch(1, 1)
+        preview_layout.setRowStretch(0, 0)
+        preview_layout.setRowStretch(1, 1)
         self.left_view = ImageView("Left Camera")
         self.right_view = ImageView("Right Camera")
         self.left_view.image_clicked.connect(self._handle_image_click)
         self.right_view.image_clicked.connect(self._handle_image_click)
-        preview_layout.addWidget(QLabel("Left Camera"), 0, 0)
-        preview_layout.addWidget(QLabel("Right Camera"), 0, 1)
+        left_title = QLabel("Left Camera")
+        right_title = QLabel("Right Camera")
+        left_title.setMaximumHeight(20)
+        right_title.setMaximumHeight(20)
+        preview_layout.addWidget(left_title, 0, 0)
+        preview_layout.addWidget(right_title, 0, 1)
         preview_layout.addWidget(self.left_view, 1, 0)
         preview_layout.addWidget(self.right_view, 1, 1)
         preview_panel_layout.addLayout(preview_layout, stretch=1)
@@ -172,8 +251,8 @@ class MainWindow(QMainWindow):
         self.resolution = self._resolution_combo(cam.width, cam.height)
         self.fps = self._spin(1, 120, cam.fps)
         self.backend = QComboBox()
-        self.backend.addItems(["AUTO", *BACKEND_MAP.keys()])
-        self.backend.setCurrentText(cam.backend)
+        self.backend.addItems(list(BACKEND_OPTIONS))
+        self.backend.setCurrentText(cam.backend if cam.backend in BACKEND_OPTIONS else "AUTO")
         self.pixel_format = QComboBox()
         self.pixel_format.addItems(list(PIXEL_FORMATS))
         self.pixel_format.setCurrentText(cam.pixel_format)
@@ -230,20 +309,53 @@ class MainWindow(QMainWindow):
         self.markers_y = self._spin(1, 30, aruco.markers_y)
         self.marker_length = self._double_spin(0.001, 1.0, aruco.marker_length_m)
         self.marker_separation = self._double_spin(0.0, 1.0, aruco.marker_separation_m)
+        self.board_mirror_x = QCheckBox("Mirror board X")
+        self.board_mirror_x.setChecked(aruco.board_mirror_x)
         form.addRow("Dictionary", self.dictionary)
         form.addRow("Markers X", self.markers_x)
         form.addRow("Markers Y", self.markers_y)
         form.addRow("Marker length m", self.marker_length)
         form.addRow("Separation m", self.marker_separation)
+        form.addRow("", self.board_mirror_x)
         self.calibrate_button = QPushButton("Start Calibration")
         self.calibrate_button.clicked.connect(self._calibrate)
         self.load_button = QPushButton("Load Calibration")
         self.load_button.clicked.connect(self._load_calibration)
         self.calibration_metrics = QLabel("Errors: --")
+        self.calibration_metrics.setWordWrap(True)
         self.output_path_label = QLabel(f"Output: {self.config.output.dir}")
+        self.output_path_label.setWordWrap(True)
         form.addRow(self.calibrate_button, self.load_button)
         form.addRow("Result", self.calibration_metrics)
         form.addRow("Output", self.output_path_label)
+        return group
+
+    def _depth_group(self) -> QGroupBox:
+        group = QGroupBox("3. Depth Parameters")
+        form = QFormLayout(group)
+        self.depth_preset = QComboBox()
+        self.depth_preset.addItems(list(DEPTH_PRESETS))
+        self.depth_preset.setCurrentText("Balanced")
+        self.depth_num_disparities = self._value_combo((128, 192, 256, 320), 192)
+        self.depth_block_size = self._value_combo((3, 5, 7, 9, 11), 7)
+        self.depth_uniqueness_ratio = self._value_combo((5, 10, 15), 10)
+        self.depth_speckle_window_size = self._value_combo((0, 50, 100, 200), 100)
+        self.depth_speckle_range = self._value_combo((1, 2, 4), 2)
+        self.depth_disp12_max_diff = self._value_combo((-1, 1, 2, 5), 1)
+        self.depth_display_mode = QComboBox()
+        self.depth_display_mode.addItems(("Raw", "Filtered"))
+        self.depth_preset.currentTextChanged.connect(self._apply_depth_preset)
+        form.addRow("Preset", self.depth_preset)
+        form.addRow("Display", self.depth_display_mode)
+        form.addRow("numDisparities", self.depth_num_disparities)
+        form.addRow("blockSize", self.depth_block_size)
+        form.addRow("uniquenessRatio", self.depth_uniqueness_ratio)
+        form.addRow("speckleWindowSize", self.depth_speckle_window_size)
+        form.addRow("speckleRange", self.depth_speckle_range)
+        form.addRow("disp12MaxDiff", self.depth_disp12_max_diff)
+        hint = QLabel("Changes apply to the next depth frame.")
+        hint.setWordWrap(True)
+        form.addRow("", hint)
         return group
 
     def _ranging_group(self) -> QGroupBox:
@@ -251,10 +363,19 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(group)
         self.detect_button = QPushButton("Detect Current")
         self.detect_button.clicked.connect(self._detect_current)
+        self.freeze_button = QPushButton("Freeze Frame")
+        self.freeze_button.clicked.connect(self._toggle_freeze)
+        self.view_left_original_button = QPushButton("View Left Original")
+        self.view_left_original_button.clicked.connect(lambda: self._open_original_view("left"))
+        self.view_right_original_button = QPushButton("View Right Original")
+        self.view_right_original_button.clicked.connect(lambda: self._open_original_view("right"))
         self.guides_check = QCheckBox("Horizontal guides")
         self.guides_check.setChecked(True)
         self.ranging_hint = QLabel("Depth and rectified views require calibration.")
         layout.addWidget(self.detect_button)
+        layout.addWidget(self.freeze_button)
+        layout.addWidget(self.view_left_original_button)
+        layout.addWidget(self.view_right_original_button)
         layout.addWidget(self.guides_check)
         layout.addWidget(self.ranging_hint)
         return group
@@ -273,6 +394,13 @@ class MainWindow(QMainWindow):
         spin.setValue(value)
         return spin
 
+    def _value_combo(self, values: tuple[int, ...], current: int) -> QComboBox:
+        combo = QComboBox()
+        for value in values:
+            combo.addItem(str(value), value)
+        combo.setCurrentText(str(current if current in values else values[0]))
+        return combo
+
     def _camera_combo(self, current_index: int) -> QComboBox:
         combo = QComboBox()
         combo.setEditable(True)
@@ -285,11 +413,10 @@ class MainWindow(QMainWindow):
         combo = QComboBox()
         options = list(RESOLUTION_OPTIONS)
         current = (width, height)
-        if current not in options:
-            options.insert(0, current)
         for option_width, option_height in options:
             combo.addItem(resolution_label(option_width, option_height))
-        combo.setCurrentText(resolution_label(width, height))
+        selected = current if current in options else DEFAULT_RESOLUTION
+        combo.setCurrentText(resolution_label(*selected))
         return combo
 
     def _double_spin(self, minimum: float, maximum: float, value: float) -> QDoubleSpinBox:
@@ -313,6 +440,33 @@ class MainWindow(QMainWindow):
             pixel_format=self.pixel_format.currentText(),
         )
 
+    def _current_disparity_config(self) -> DisparityConfig:
+        return DisparityConfig(
+            num_disparities=int(self.depth_num_disparities.currentText()),
+            block_size=int(self.depth_block_size.currentText()),
+            uniqueness_ratio=int(self.depth_uniqueness_ratio.currentText()),
+            speckle_window_size=int(self.depth_speckle_window_size.currentText()),
+            speckle_range=int(self.depth_speckle_range.currentText()),
+            disp12_max_diff=int(self.depth_disp12_max_diff.currentText()),
+        ).normalized()
+
+    def _set_combo_value(self, combo: QComboBox, value: int) -> None:
+        text = str(value)
+        if combo.findText(text) < 0:
+            combo.addItem(text, value)
+        combo.setCurrentText(text)
+
+    def _apply_depth_preset(self, preset_name: str) -> None:
+        config = DEPTH_PRESETS.get(preset_name)
+        if config is None:
+            return
+        self._set_combo_value(self.depth_num_disparities, config.num_disparities)
+        self._set_combo_value(self.depth_block_size, config.block_size)
+        self._set_combo_value(self.depth_uniqueness_ratio, config.uniqueness_ratio)
+        self._set_combo_value(self.depth_speckle_window_size, config.speckle_window_size)
+        self._set_combo_value(self.depth_speckle_range, config.speckle_range)
+        self._set_combo_value(self.depth_disp12_max_diff, config.disp12_max_diff)
+
     def _selected_camera_index(self, combo: QComboBox) -> int:
         data = combo.currentData()
         if isinstance(data, int):
@@ -329,10 +483,13 @@ class MainWindow(QMainWindow):
             markers_y=self.markers_y.value(),
             marker_length_m=self.marker_length.value(),
             marker_separation_m=self.marker_separation.value(),
+            board_mirror_x=self.board_mirror_x.isChecked(),
         )
 
     def _toggle_cameras(self) -> None:
-        if self.left_worker and self.left_worker.isRunning():
+        if self.open_button.text() == "Stopping Cameras":
+            return
+        if self._any_camera_worker_running():
             self._stop_cameras("Open Cameras button toggled to close")
             return
         camera = self._current_camera_config()
@@ -350,7 +507,9 @@ class MainWindow(QMainWindow):
             camera.backend,
             camera.pixel_format,
         )
-        self.left_worker.status.connect(self._log)
+        self.left_worker.status.connect(self._handle_camera_status)
+        self.left_worker.finished.connect(self._camera_worker_finished)
+        self._opening_labels = {"left"}
         self.left_worker.start()
         if not camera.single_mode:
             self.right_worker = SingleCameraWorker(
@@ -362,58 +521,133 @@ class MainWindow(QMainWindow):
                 camera.backend,
                 camera.pixel_format,
             )
-            self.right_worker.status.connect(self._log)
+            self.right_worker.status.connect(self._handle_camera_status)
+            self.right_worker.finished.connect(self._camera_worker_finished)
+            self._opening_labels.add("right")
             self.right_worker.start()
         self.preview_timer.start()
-        self.open_button.setText("Close Cameras")
+        self.open_button.setText("Opening Cameras")
+        self.open_button.setEnabled(False)
         self.left_state.setText(f"Left: opening index {camera.left_index}")
         self.right_state.setText("Right: single mode" if camera.single_mode else f"Right: opening index {camera.right_index}")
         self._log("Opening cameras. Close Windows Camera or any other program using the cameras if no frames appear.")
 
+    def _handle_camera_status(self, message: str) -> None:
+        self._log(message)
+        is_opened = ": opened index " in message
+        is_open_failure = ": failed to open camera " in message or ": camera thread error:" in message
+        if is_opened or is_open_failure:
+            label = message.split(":", maxsplit=1)[0]
+            self._opening_labels.discard(label)
+        if is_open_failure and self.open_button.text() == "Opening Cameras":
+            self._stop_cameras(f"{message.split(':', maxsplit=1)[0]} failed during stereo open")
+            self.left_worker = None
+            self.right_worker = None
+            self.preview_timer.stop()
+            self._opening_labels.clear()
+            self.open_button.setText("Open Cameras")
+            self.open_button.setEnabled(True)
+            self.left_state.setText("Left: closed")
+            self.right_state.setText("Right: closed")
+            self.fps_state.setText("FPS: --")
+            return
+        if not self._opening_labels and self.open_button.text() == "Opening Cameras":
+            self.open_button.setText("Close Cameras")
+            self.open_button.setEnabled(True)
+
     def _stop_cameras(self, reason: str = "unspecified") -> None:
         self._log(f"Stopping cameras: {reason}")
+        still_running = False
         if self.left_worker:
-            self.left_worker.stop()
-            self.left_worker = None
+            if self.left_worker.stop():
+                self.left_worker = None
+            else:
+                still_running = True
         if self.right_worker:
-            self.right_worker.stop()
-            self.right_worker = None
+            if self.right_worker.stop():
+                self.right_worker = None
+            else:
+                still_running = True
+        self.preview_timer.stop()
+        self._opening_labels.clear()
+        if still_running:
+            self.open_button.setText("Stopping Cameras")
+            self.open_button.setEnabled(False)
+            self._log("Camera backend is still stopping; waiting for thread cleanup")
+        else:
+            self.open_button.setText("Open Cameras")
+            self.open_button.setEnabled(True)
+        self.left_state.setText("Left: closed")
+        self.right_state.setText("Right: closed")
+        self.fps_state.setText("FPS: --")
+
+    def _camera_worker_finished(self) -> None:
+        left_running = self.left_worker is not None and self.left_worker.isRunning()
+        right_running = self.right_worker is not None and self.right_worker.isRunning()
+        if left_running or right_running:
+            return
+        self.left_worker = None
+        self.right_worker = None
+        self._opening_labels.clear()
         self.preview_timer.stop()
         self.open_button.setText("Open Cameras")
+        self.open_button.setEnabled(True)
         self.left_state.setText("Left: closed")
         self.right_state.setText("Right: closed")
         self.fps_state.setText("FPS: --")
 
     def _refresh_preview(self) -> None:
+        if self._freeze_enabled:
+            if self.frozen_left is not None:
+                frozen_right = self.frozen_right if self.right_worker is not None else None
+                self._update_frames(self.frozen_left, frozen_right, freeze_preview=True)
+                self._update_camera_stats()
+            return
         if self.left_worker is None:
             return
         left = self.left_worker.get_latest()
-        if left is None:
-            return
         right = None if self.right_worker is None else self.right_worker.get_latest()
+        if left is None:
+            if self.right_worker is not None and right is not None:
+                self.latest_left = None
+                self.latest_right = right
+                self.left_view.setText("Waiting for left camera")
+                self.right_view.set_frame(preview_copy(right))
+                self._update_camera_stats()
+            return
         if self.right_worker is not None and right is None:
             self.left_view.set_frame(preview_copy(left))
             self.right_view.setText("Waiting for right camera")
+            self._update_camera_stats()
             return
         self._update_frames(left, right)
         self._update_camera_stats()
 
-    def _update_frames(self, left: np.ndarray, right: np.ndarray | None) -> None:
-        self.latest_left = left
-        self.latest_right = right
+    def _update_frames(self, left: np.ndarray, right: np.ndarray | None, freeze_preview: bool = False) -> None:
+        if not freeze_preview:
+            self.latest_left = left
+            self.latest_right = right
+        freeze_preview = freeze_preview or self._freeze_enabled
         show_left, show_right = left, right
         if right is None:
-            self.left_view.set_frame(preview_copy(show_left))
+            left_preview = preview_copy(show_left)
+            self.left_view.set_frame(left_preview)
+            self.left_view.set_source_size(show_left.shape[1], show_left.shape[0])
             self.right_view.setText("Single camera mode")
+            self.preview_info.setText("Frozen Preview" if freeze_preview else "Live Preview")
             return
         mode = self.view_mode.currentText()
         if not view_mode_enabled(mode, self.rectifier is not None):
             self.preview_info.setText("Calibration required")
             self.latest_disparity = None
-            self.left_view.set_frame(preview_copy(left))
-            self.right_view.set_frame(preview_copy(right))
+            left_preview = preview_copy(left)
+            right_preview = preview_copy(right)
+            self.left_view.set_frame(left_preview)
+            self.left_view.set_source_size(left.shape[1], left.shape[0])
+            self.right_view.set_frame(right_preview)
+            self.right_view.set_source_size(right.shape[1], right.shape[0])
             return
-        self.preview_info.setText(mode)
+        self.preview_info.setText("Frozen Preview" if freeze_preview else mode)
         if mode == "ArUco Detection":
             try:
                 aruco = self._current_aruco_config()
@@ -432,13 +666,24 @@ class MainWindow(QMainWindow):
             self.latest_disparity = None
         elif mode == "Depth / Distance" and self.rectifier is not None:
             left_rect, right_rect = self.rectifier.rectify(left, right)
-            self.latest_disparity = compute_disparity(left_rect, right_rect)
-            show_left = disparity_preview(self.latest_disparity)
-            show_right = draw_horizontal_guides(right_rect) if self.guides_check.isChecked() else right_rect
+            disparity_config = self._current_disparity_config()
+            self.latest_disparity = compute_disparity(left_rect, right_rect, disparity_config)
+            valid_x = min(disparity_config.num_disparities, max(self.latest_disparity.shape[1] - 1, 0))
+            preview_fn = filtered_disparity_preview if self.depth_display_mode.currentText() == "Filtered" else disparity_preview
+            show_left = preview_fn(self.latest_disparity)[:, valid_x:]
+            show_right = draw_depth_roi(right_rect, valid_x)
+            if self.guides_check.isChecked():
+                show_right = draw_horizontal_guides(show_right)
         else:
             self.latest_disparity = None
-        self.left_view.set_frame(preview_copy(show_left))
-        self.right_view.set_frame(preview_copy(show_right))
+        left_preview = preview_copy(show_left)
+        right_preview = preview_copy(show_right)
+        self.left_view.set_frame(left_preview)
+        self.left_view.set_source_size(show_left.shape[1], show_left.shape[0])
+        self.right_view.set_frame(right_preview)
+        self.right_view.set_source_size(show_right.shape[1], show_right.shape[0])
+        if mode == "Depth / Distance" and self.latest_disparity is not None:
+            self.left_view.set_source_rect(valid_x, 0, show_left.shape[1], show_left.shape[0])
 
     def _detect_current(self) -> None:
         if self.latest_left is None:
@@ -544,30 +789,220 @@ class MainWindow(QMainWindow):
         if self.single_mode.isChecked():
             self._log("Disable single camera mode before stereo calibration")
             return
+        was_preview_running = self.preview_timer.isActive()
         try:
+            aruco = self._current_aruco_config()
+            self.calibrate_button.setEnabled(False)
+            self.load_button.setEnabled(False)
+            review_previews: list[CalibrationPairPreview] = []
+            self._set_calibration_review_items([])
+            if was_preview_running:
+                self.preview_timer.stop()
             self._log("Calibration started")
+            self._log(
+                "Board: "
+                f"{aruco.dictionary}, {aruco.markers_x}x{aruco.markers_y}, "
+                f"tag={aruco.marker_length_m:.3f} m, spacing={aruco.marker_separation_m:.3f} m, "
+                f"mirror_x={aruco.board_mirror_x}"
+            )
+            total_pairs = len(list_image_pairs(self.config.capture.output_dir))
+            report = analyze_calibration_pairs(
+                self.config.capture.output_dir,
+                aruco,
+                on_pair=lambda preview: (review_previews.append(preview), self._show_calibration_progress(preview, total_pairs)),
+            )
+            self._show_calibration_report(report)
+            self._set_calibration_review_items(review_previews)
             result = calibrate_from_pairs(
                 self.config.capture.output_dir,
                 self.config.output.dir,
-                self._current_aruco_config(),
+                aruco,
             )
             self._set_rectifier_from_result(result)
             baseline = float(np.linalg.norm(result.T))
+            quality = calibration_quality_label(result.stereo_error)
+            self._show_calibration_result(result, baseline, quality)
             self.calibration_metrics.setText(
-                f"L {result.left_error:.4f} / R {result.right_error:.4f} / stereo {result.stereo_error:.4f}"
+                f"Pairs {report.valid_pairs}/{report.total_pairs} valid | "
+                f"L {result.left_error:.4f} / R {result.right_error:.4f} / stereo {result.stereo_error:.4f} | {quality}"
             )
             self.calibration_state.setText(f"Calibration: stereo error {result.stereo_error:.4f}")
             self.baseline_state.setText(f"Baseline: {baseline:.4f} m")
             self.output_path_label.setText(f"{Path(self.config.output.dir) / 'stereo_calib.npz'}")
             self._log(
                 "Calibration done\n"
+                f"valid pairs: {report.valid_pairs}/{report.total_pairs}\n"
                 f"left error: {result.left_error:.4f}\n"
                 f"right error: {result.right_error:.4f}\n"
                 f"stereo error: {result.stereo_error:.4f}\n"
-                f"baseline: {baseline:.4f} m"
+                f"baseline: {baseline:.4f} m\n"
+                f"quality: {quality}"
             )
         except Exception as exc:  # noqa: BLE001
             self._error(str(exc))
+        finally:
+            self.calibrate_button.setEnabled(True)
+            self.load_button.setEnabled(True)
+            if was_preview_running and self._any_camera_worker_running():
+                self.preview_timer.start()
+
+    def _show_calibration_progress(self, preview: CalibrationPairPreview, total_pairs: int) -> None:
+        self._last_calibration_preview = preview
+        stats = preview.stats
+        self._display_calibration_preview(preview, total_pairs, "checking")
+        QApplication.processEvents()
+
+    def _set_calibration_review_items(self, previews: list[CalibrationPairPreview]) -> None:
+        self._calibration_review_previews = list(previews)
+        self._updating_calibration_pair_select = True
+        self.calibration_pair_select.clear()
+        for preview in self._calibration_review_previews:
+            stats = preview.stats
+            self.calibration_pair_select.addItem(
+                f"{stats.index:04d} {stats.status} | L {stats.left_markers} R {stats.right_markers} common {stats.common_points}"
+            )
+        self._updating_calibration_pair_select = False
+        self._set_calibration_review_enabled(bool(self._calibration_review_previews))
+        if self._calibration_review_previews:
+            self.calibration_pair_select.setCurrentIndex(0)
+            self._show_calibration_review_pair(0)
+
+    def _set_calibration_review_enabled(self, enabled: bool) -> None:
+        self.calibration_pair_select.setEnabled(enabled)
+        self.prev_calibration_pair_button.setEnabled(False)
+        self.next_calibration_pair_button.setEnabled(enabled and len(self._calibration_review_previews) > 1)
+
+    def _calibration_pair_selected(self, index: int) -> None:
+        if self._updating_calibration_pair_select:
+            return
+        self._show_calibration_review_pair(index)
+
+    def _show_previous_calibration_pair(self) -> None:
+        self._show_calibration_review_pair(self.calibration_pair_select.currentIndex() - 1)
+
+    def _show_next_calibration_pair(self) -> None:
+        self._show_calibration_review_pair(self.calibration_pair_select.currentIndex() + 1)
+
+    def _show_calibration_review_pair(self, index: int) -> None:
+        if not self._calibration_review_previews:
+            self._set_calibration_review_enabled(False)
+            return
+        index = max(0, min(index, len(self._calibration_review_previews) - 1))
+        if self.calibration_pair_select.currentIndex() != index:
+            self._updating_calibration_pair_select = True
+            self.calibration_pair_select.setCurrentIndex(index)
+            self._updating_calibration_pair_select = False
+        self.prev_calibration_pair_button.setEnabled(index > 0)
+        self.next_calibration_pair_button.setEnabled(index < len(self._calibration_review_previews) - 1)
+        preview = self._calibration_review_previews[index]
+        self._last_calibration_preview = preview
+        self._display_calibration_preview(preview, len(self._calibration_review_previews), "review")
+
+    def _display_calibration_preview(self, preview: CalibrationPairPreview, total_pairs: int, mode: str) -> None:
+        stats = preview.stats
+        line = (
+            f"Pair {stats.index:04d}/{total_pairs} {stats.status} | "
+            f"L {stats.left_markers} R {stats.right_markers} common {stats.common_points}"
+        )
+        self.calibration_metrics.setText(line)
+        self.calibration_state.setText(f"Calibration: {mode} {stats.index:04d}/{total_pairs}")
+        if stats.status != "VALID":
+            self._set_diagnostic(f"{stats.filename}: {stats.reason}")
+        else:
+            self._set_diagnostic(line)
+
+        left_image = self._draw_calibration_preview(preview.left_image, preview.left_detection, line, stats.reason)
+        right_image = self._draw_calibration_preview(preview.right_image, preview.right_detection, line, stats.reason)
+        if left_image is not None:
+            self.left_view.set_frame(preview_copy(left_image))
+            self.left_view.set_source_size(left_image.shape[1], left_image.shape[0])
+        if right_image is not None:
+            self.right_view.set_frame(preview_copy(right_image))
+            self.right_view.set_source_size(right_image.shape[1], right_image.shape[0])
+        if mode == "review":
+            self.frozen_left = None if left_image is None else left_image.copy()
+            self.frozen_right = None if right_image is None else right_image.copy()
+            self._freeze_enabled = True
+            self.freeze_button.setText("Unfreeze")
+            self.preview_info.setText("Calibration Review")
+
+    def _show_calibration_report(self, report: CalibrationDatasetReport) -> None:
+        if report.total_pairs == 0:
+            raise RuntimeError(f"No image pairs found in {self.config.capture.output_dir}")
+        size_text = "--" if report.image_size is None else f"{report.image_size[0]}x{report.image_size[1]}"
+        summary = (
+            f"Calibration input: total={report.total_pairs}, readable={report.readable_pairs}, "
+            f"valid={report.valid_pairs}, weak={report.weak_pairs}, invalid={report.invalid_pairs}, image={size_text}, "
+            f"avg common={report.average_common_points:.1f}"
+        )
+        self._log(summary)
+        if report.weak_filenames:
+            self._log("Weak pairs skipped: " + ", ".join(report.weak_filenames[:30]))
+        if report.invalid_filenames:
+            self._log("Invalid pairs: " + ", ".join(report.invalid_filenames[:30]))
+
+    def _show_calibration_result(self, result: StereoCalibrationResult, baseline: float, quality: str) -> None:
+        if self._last_calibration_preview is None:
+            return
+        text = (
+            f"RESULT {quality}\n"
+            f"L err {result.left_error:.4f}  R err {result.right_error:.4f}\n"
+            f"stereo {result.stereo_error:.4f}  baseline {baseline:.4f} m"
+        )
+        preview = self._last_calibration_preview
+        left_image = self._draw_calibration_preview(preview.left_image, preview.left_detection, text, "")
+        right_image = self._draw_calibration_preview(preview.right_image, preview.right_detection, text, "")
+        if left_image is not None:
+            self.left_view.set_frame(preview_copy(left_image))
+            self.left_view.set_source_size(left_image.shape[1], left_image.shape[0])
+        if right_image is not None:
+            self.right_view.set_frame(preview_copy(right_image))
+            self.right_view.set_source_size(right_image.shape[1], right_image.shape[0])
+        self.frozen_left = None if left_image is None else left_image.copy()
+        self.frozen_right = None if right_image is None else right_image.copy()
+        self._freeze_enabled = True
+        self.freeze_button.setText("Unfreeze")
+        self.preview_info.setText("Calibration Result")
+        QApplication.processEvents()
+
+    def _draw_calibration_preview(
+        self,
+        image: np.ndarray | None,
+        detection,
+        title: str,
+        detail: str,
+    ) -> np.ndarray | None:
+        if image is None:
+            return None
+        output = image.copy()
+        if detection is not None:
+            output = draw_detection(output, detection)
+        lines = title.splitlines()
+        if detail and detail != "OK":
+            lines.extend(detail.splitlines())
+        return self._draw_text_panel(output, lines)
+
+    def _draw_text_panel(self, image: np.ndarray, lines: list[str]) -> np.ndarray:
+        output = image.copy()
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        scale = max(0.45, min(output.shape[1], output.shape[0]) / 900)
+        thickness = max(1, int(round(scale * 2)))
+        padding = 8
+        line_gap = 8
+        sizes = [cv2.getTextSize(line, font, scale, thickness)[0] for line in lines]
+        panel_width = max((width for width, _ in sizes), default=1) + padding * 2
+        panel_height = sum(height for _, height in sizes) + line_gap * max(len(lines) - 1, 0) + padding * 2
+        panel_width = min(panel_width, output.shape[1])
+        panel_height = min(panel_height, output.shape[0])
+        overlay = output.copy()
+        cv2.rectangle(overlay, (0, 0), (panel_width, panel_height), (0, 0, 0), -1)
+        cv2.addWeighted(overlay, 0.62, output, 0.38, 0, output)
+        y = padding
+        for line, (_, height) in zip(lines, sizes):
+            y += height
+            cv2.putText(output, line, (padding, y), font, scale, (255, 255, 255), thickness, cv2.LINE_AA)
+            y += line_gap
+        return output
 
     def _load_calibration(self) -> None:
         try:
@@ -583,11 +1018,14 @@ class MainWindow(QMainWindow):
         self.rectifier = Rectifier.from_calibration({k: v for k, v in result.as_dict().items() if isinstance(v, np.ndarray) or k == "image_size"})
 
     def _handle_image_click(self, x: int, y: int) -> None:
+        self._handle_preview_click("preview", x, y)
+
+    def _handle_preview_click(self, side: str, x: int, y: int) -> None:
         if self.view_mode.currentText() != "Depth / Distance" or self.rectifier is None or self.latest_disparity is None:
-            self._log(f"Clicked image point x={x}, y={y}")
-            self.distance_state.setText(f"Point: {x}, {y}")
+            self._log(f"Clicked {side} image point x={x}, y={y}")
+            self.distance_state.setText(f"Point: {side} {x}, {y}")
             return
-        distance = distance_at(self.latest_disparity, self.rectifier.Q, x, y)
+        distance = distance_at(self.latest_disparity, self.rectifier.Q, x, y, window_size=5)
         if distance is None:
             self._log(f"x={x}, y={y}: no valid depth")
             self.distance_state.setText(f"Distance: invalid at {x}, {y}")
@@ -608,20 +1046,27 @@ class MainWindow(QMainWindow):
         self.pair_state.setText(text)
 
     def _update_camera_stats(self) -> None:
-        parts = []
-        for worker in (self.left_worker, self.right_worker):
+        summary_parts = []
+        for side, worker, view in (
+            ("L", self.left_worker, self.left_view),
+            ("R", self.right_worker, self.right_view),
+        ):
             if worker is None:
+                view.set_overlay_text("")
                 continue
             stats = worker.snapshot_stats()
             age = stats["age"]
             age_text = "--" if age < 0 else f"{age:.2f}s"
-            parts.append(
-                f"{stats['label']} idx {stats['index']}: "
-                f"{stats['fps']:.1f} fps, frames {stats['frames']}, age {age_text}"
+            summary_parts.append(f"{side} {stats['fps']:.1f} fps")
+            view.set_overlay_text(
+                f"idx {stats['index']}\n"
+                f"{stats['fps']:.1f} fps\n"
+                f"frames {stats['frames']}\n"
+                f"age {age_text}"
             )
-        stats_text = " | ".join(parts) if parts else "left fps: -- | right fps: --"
-        self.camera_stats.setText(stats_text)
-        self.fps_state.setText(f"FPS: {stats_text}")
+        summary_text = " | ".join(summary_parts) if summary_parts else "L -- fps | R -- fps"
+        self.camera_stats.setText(summary_text)
+        self.fps_state.setText(f"Camera: {summary_text}")
         if self.left_worker is not None:
             self.left_state.setText(f"Left: online index {self.left_worker.index}")
         if self.right_worker is not None:
@@ -643,6 +1088,9 @@ class MainWindow(QMainWindow):
             self._log(f"{mode} requires calibration.")
             self.view_mode.setCurrentText("Live Preview")
             return
+        depth_mode = mode == "Depth / Distance"
+        self.calibration_group.setVisible(not depth_mode)
+        self.depth_group.setVisible(depth_mode)
         self.preview_info.setText(mode)
 
     def _refresh_diagnostics(self) -> None:
@@ -658,3 +1106,35 @@ class MainWindow(QMainWindow):
 
     def _set_diagnostic(self, message: str) -> None:
         self.diagnostics_label.setText(message)
+
+    def _toggle_freeze(self) -> None:
+        if not self._freeze_enabled:
+            if self.latest_left is None:
+                self._log("No camera frames available to freeze")
+                return
+            self.frozen_left = self.latest_left.copy()
+            self.frozen_right = None if self.latest_right is None else self.latest_right.copy()
+            self._freeze_enabled = True
+            self.freeze_button.setText("Unfreeze")
+            self.preview_info.setText("Frozen Preview")
+            return
+        self._freeze_enabled = False
+        self.frozen_left = None
+        self.frozen_right = None
+        self.freeze_button.setText("Freeze Frame")
+        self.preview_info.setText(self.view_mode.currentText())
+
+    def _frame_for_original_view(self, side: str) -> np.ndarray | None:
+        if side == "left":
+            return self.frozen_left if self._freeze_enabled and self.frozen_left is not None else self.latest_left
+        return self.frozen_right if self._freeze_enabled and self.frozen_right is not None else self.latest_right
+
+    def _open_original_view(self, side: str) -> None:
+        frame = self._frame_for_original_view(side)
+        if frame is None:
+            self._log(f"No {side} frame available")
+            return
+        dialog = OriginalImageDialog(f"{side.title()} Original", frame, self)
+        dialog.point_selected.connect(lambda x, y, side_name=side: self._handle_preview_click(side_name, x, y))
+        dialog.show()
+        self._original_dialogs.append(dialog)

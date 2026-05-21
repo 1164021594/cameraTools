@@ -51,8 +51,36 @@ def create_board(config: ArucoConfig) -> cv2.aruco.GridBoard:
     )
 
 
+def board_object_map(config: ArucoConfig) -> dict[int, np.ndarray]:
+    if config.markers_x < 1 or config.markers_y < 1:
+        raise ValueError("markers_x and markers_y must be positive")
+    if config.marker_length_m <= 0 or config.marker_separation_m < 0:
+        raise ValueError("marker sizes must be positive")
+    step = config.marker_length_m + config.marker_separation_m
+    object_points: dict[int, np.ndarray] = {}
+    for row in range(config.markers_y):
+        for col in range(config.markers_x):
+            marker_id = row * config.markers_x + col
+            mapped_col = config.markers_x - 1 - col if config.board_mirror_x else col
+            x0 = float(mapped_col * step)
+            y0 = float(row * step)
+            length = float(config.marker_length_m)
+            object_points[marker_id] = np.asarray(
+                [
+                    [x0, y0, 0.0],
+                    [x0 + length, y0, 0.0],
+                    [x0 + length, y0 + length, 0.0],
+                    [x0, y0 + length, 0.0],
+                ],
+                dtype=np.float32,
+            )
+    return object_points
+
+
 def create_detector(config: ArucoConfig) -> cv2.aruco.ArucoDetector:
     params = cv2.aruco.DetectorParameters()
+    if "APRILTAG_36" in config.dictionary.upper():
+        params.markerBorderBits = 2
     return cv2.aruco.ArucoDetector(create_dictionary(config.dictionary), params)
 
 
@@ -70,15 +98,22 @@ def draw_detection(image: np.ndarray, result: DetectionResult) -> np.ndarray:
 
 
 def common_board_points(
-    board: cv2.aruco.GridBoard,
+    board: cv2.aruco.GridBoard | dict[int, np.ndarray],
     left: DetectionResult,
     right: DetectionResult,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     if left.ids is None or right.ids is None:
         return _empty_points()
 
-    board_ids = board.getIds().flatten()
-    board_obj_points = board.getObjPoints()
+    if isinstance(board, dict):
+        object_points_by_id = board
+    else:
+        board_ids = board.getIds().flatten()
+        board_obj_points = board.getObjPoints()
+        object_points_by_id = {
+            int(marker_id): np.asarray(board_obj_points[index], dtype=np.float32)
+            for index, marker_id in enumerate(board_ids)
+        }
     left_ids = left.ids.flatten()
     right_ids = right.ids.flatten()
     common_ids = np.intersect1d(left_ids, right_ids)
@@ -88,14 +123,13 @@ def common_board_points(
     img_points_r: list[np.ndarray] = []
 
     for marker_id in common_ids:
-        board_match = np.where(board_ids == marker_id)[0]
-        if len(board_match) == 0:
+        marker_id = int(marker_id)
+        if marker_id not in object_points_by_id:
             continue
-        idx_board = int(board_match[0])
         idx_l = int(np.where(left_ids == marker_id)[0][0])
         idx_r = int(np.where(right_ids == marker_id)[0][0])
 
-        obj_points.extend(np.asarray(board_obj_points[idx_board], dtype=np.float32))
+        obj_points.extend(np.asarray(object_points_by_id[marker_id], dtype=np.float32))
         img_points_l.extend(np.asarray(left.corners[idx_l][0], dtype=np.float32))
         img_points_r.extend(np.asarray(right.corners[idx_r][0], dtype=np.float32))
 

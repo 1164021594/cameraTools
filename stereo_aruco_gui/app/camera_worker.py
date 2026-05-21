@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 import time
 from threading import Lock
 
@@ -14,12 +15,31 @@ from stereo_aruco_gui.app.config import CameraConfig
 BACKEND_MAP = dict(BACKENDS)
 AUTO_BACKENDS = [("DSHOW", BACKEND_MAP["DSHOW"])]
 PIXEL_FORMATS = ("MJPG", "YUYV", "DEFAULT")
+OPEN_TIMEOUT_SECONDS = 10.0
+STARTUP_STABLE_FRAMES = 3
+
+
+@dataclass(frozen=True)
+class OpenAttempt:
+    backend_name: str
+    opened: bool
+    read_ok: bool
+    usable: bool
+    actual_width: float
+    actual_height: float
+    actual_fps: float
+    shape: tuple[int, ...] | None
+    error: str = ""
 
 
 def usable_frame(frame: np.ndarray | None) -> bool:
     if frame is None:
         return False
     return float(frame.mean()) > 3.0 or int(frame.max()) > 15
+
+
+def accept_frame_for_preview(frame: np.ndarray | None) -> bool:
+    return frame is not None
 
 
 def preview_copy(frame: np.ndarray, max_width: int = 640) -> np.ndarray:
@@ -32,6 +52,29 @@ def preview_copy(frame: np.ndarray, max_width: int = 640) -> np.ndarray:
 
 def should_decode_frame(now: float, last_decode: float, interval: float) -> bool:
     return now - last_decode >= interval
+
+
+def open_failure_summary(
+    label: str,
+    index: int,
+    width: int,
+    height: int,
+    fps: int,
+    pixel_format: str,
+    attempts: list[OpenAttempt],
+) -> str:
+    header = f"{label}: failed to open camera {index}; requested={width}x{height}@{fps} {pixel_format}"
+    if not attempts:
+        return f"{header}; no backend attempted"
+    details = []
+    for attempt in attempts:
+        actual = f"{attempt.actual_width:.0f}x{attempt.actual_height:.0f}@{attempt.actual_fps:.1f}"
+        details.append(
+            f"{attempt.backend_name} opened={attempt.opened} read_ok={attempt.read_ok} "
+            f"usable={attempt.usable} actual={actual} shape={attempt.shape}"
+            f"{' error=' + attempt.error if attempt.error else ''}"
+        )
+    return f"{header}; " + " | ".join(details)
 
 
 def read_stereo_pair(left_cap, right_cap) -> tuple[bool, np.ndarray | None, np.ndarray | None]:  # noqa: ANN001
@@ -62,6 +105,7 @@ class SingleCameraWorker(QThread):
         label: str,
         backend: str = "AUTO",
         pixel_format: str = "MJPG",
+        open_timeout_s: float = OPEN_TIMEOUT_SECONDS,
     ) -> None:
         super().__init__()
         self.index = index
@@ -71,6 +115,7 @@ class SingleCameraWorker(QThread):
         self.label = label
         self.backend = backend
         self.pixel_format = pixel_format
+        self.open_timeout_s = open_timeout_s
         self._backend_start = 0
         self._active_backend_name = "none"
         self._running = False
@@ -80,21 +125,42 @@ class SingleCameraWorker(QThread):
         self.received_frame_count = 0
         self.last_frame_time = 0.0
         self.start_time = time.monotonic()
+        self.open_attempts: list[OpenAttempt] = []
         self._lock = Lock()
 
     def run(self) -> None:
+        try:
+            self._run_capture_loop()
+        except Exception as exc:  # noqa: BLE001
+            self.status.emit(f"{self.label}: camera thread error: {exc}")
+        finally:
+            self._release()
+            if self._running:
+                self._running = False
+                self.status.emit(f"{self.label}: closed (thread exited)")
+
+    def _run_capture_loop(self) -> None:
         self._running = True
         self._stop_requested = False
         backend_name = self._open()
         if self._capture is None:
-            self.status.emit(f"{self.label}: failed to open camera {self.index}")
+            self.status.emit(
+                open_failure_summary(
+                    self.label,
+                    self.index,
+                    self.width,
+                    self.height,
+                    self.fps,
+                    self.pixel_format,
+                    self.open_attempts,
+                )
+            )
+            self._running = False
             return
         self.status.emit(f"{self.label}: opened index {self.index} with {backend_name}")
         consecutive_failures = 0
         last_notice = 0.0
         last_bad_notice = 0.0
-        last_decode = 0.0
-        decode_interval = 1.0 / max(1, min(self.fps, 30))
 
         while self._running:
             if self._capture is None:
@@ -105,15 +171,8 @@ class SingleCameraWorker(QThread):
                     continue
                 self.status.emit(f"{self.label}: reopened with {backend_name}")
 
-            grabbed = self._capture.grab()
             now = time.monotonic()
-            if grabbed and not should_decode_frame(now, last_decode, decode_interval):
-                time.sleep(0.001)
-                continue
-            if grabbed:
-                ok, frame = self._capture.retrieve()
-            else:
-                ok, frame = self._capture.read()
+            ok, frame = self._capture.read()
             if not ok:
                 consecutive_failures += 1
                 if now - last_notice > 1.0:
@@ -128,7 +187,8 @@ class SingleCameraWorker(QThread):
                 continue
 
             consecutive_failures = 0
-            last_decode = now
+            if accept_frame_for_preview(frame):
+                self.receive_frame(frame)
             if not usable_frame(frame):
                 now = time.monotonic()
                 if now - last_bad_notice > 1.0:
@@ -137,17 +197,12 @@ class SingleCameraWorker(QThread):
                 time.sleep(0.05)
                 continue
 
-            self.receive_frame(frame)
-
-        self._release()
-        reason = "stop requested" if self._stop_requested else "thread exited"
-        self.status.emit(f"{self.label}: closed ({reason})")
-
-    def stop(self) -> None:
+    def stop(self) -> bool:
         self._stop_requested = True
         self._running = False
         if self.isRunning():
-            self.wait(2000)
+            return self.wait(12000)
+        return True
 
     def receive_frame(self, frame: np.ndarray) -> None:
         with self._lock:
@@ -173,19 +228,77 @@ class SingleCameraWorker(QThread):
 
     def _open(self) -> str:
         backends = self._next_backends()
+        self.open_attempts = []
+        deadline = time.monotonic() + self.open_timeout_s
         for backend_name, backend in backends:
+            if time.monotonic() >= deadline:
+                break
             cap = cv2.VideoCapture(self.index, backend)
             if not cap.isOpened():
+                self.open_attempts.append(OpenAttempt(backend_name, False, False, False, 0.0, 0.0, 0.0, None))
                 cap.release()
                 continue
-            configure_capture(cap, self.width, self.height, self.fps, self.pixel_format)
-            for _ in range(10):
+            if not configure_capture(cap, self.width, self.height, self.fps, self.pixel_format):
+                self.open_attempts.append(
+                    OpenAttempt(
+                        backend_name,
+                        True,
+                        False,
+                        False,
+                        safe_get(cap, cv2.CAP_PROP_FRAME_WIDTH),
+                        safe_get(cap, cv2.CAP_PROP_FRAME_HEIGHT),
+                        safe_get(cap, cv2.CAP_PROP_FPS),
+                        None,
+                        "configure failed",
+                    )
+                )
+                cap.release()
+                continue
+            read_ok = False
+            stable_frames = 0
+            frame_shape = None
+            timed_out = False
+            while time.monotonic() < deadline:
                 ok, frame = cap.read()
-                if ok and usable_frame(frame):
+                read_ok = read_ok or ok
+                if ok and frame is not None:
+                    frame_shape = tuple(frame.shape)
+                if ok and accept_frame_for_preview(frame):
+                    stable_frames += 1
+                else:
+                    stable_frames = 0
+                if stable_frames >= STARTUP_STABLE_FRAMES:
                     self._capture = cap
                     self._active_backend_name = backend_name
+                    self.receive_frame(frame)
+                    self.open_attempts.append(
+                        OpenAttempt(
+                            backend_name,
+                            True,
+                            read_ok,
+                            True,
+                            safe_get(cap, cv2.CAP_PROP_FRAME_WIDTH),
+                            safe_get(cap, cv2.CAP_PROP_FRAME_HEIGHT),
+                            safe_get(cap, cv2.CAP_PROP_FPS),
+                            frame_shape,
+                        )
+                    )
                     return backend_name
                 time.sleep(0.03)
+            timed_out = time.monotonic() >= deadline
+            self.open_attempts.append(
+                OpenAttempt(
+                    backend_name,
+                    True,
+                    read_ok,
+                    stable_frames >= STARTUP_STABLE_FRAMES,
+                    safe_get(cap, cv2.CAP_PROP_FRAME_WIDTH),
+                    safe_get(cap, cv2.CAP_PROP_FRAME_HEIGHT),
+                    safe_get(cap, cv2.CAP_PROP_FPS),
+                    frame_shape,
+                    "open timeout" if timed_out else "",
+                )
+            )
             cap.release()
         self._capture = None
         self._active_backend_name = "none"
@@ -346,10 +459,27 @@ class CameraWorker(QThread):
                 cap.release()
 
 
-def configure_capture(cap: cv2.VideoCapture, width: int, height: int, fps: int, pixel_format: str = "MJPG") -> None:
+def safe_get(cap: cv2.VideoCapture, prop: int) -> float:
+    try:
+        return float(cap.get(prop))
+    except Exception:  # noqa: BLE001
+        return 0.0
+
+
+def safe_set(cap: cv2.VideoCapture, prop: int, value: float | int) -> bool:
+    try:
+        cap.set(prop, value)
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def configure_capture(cap: cv2.VideoCapture, width: int, height: int, fps: int, pixel_format: str = "MJPG") -> bool:
+    ok = True
     if pixel_format != "DEFAULT":
-        cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*pixel_format))
-    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
-    cap.set(cv2.CAP_PROP_FPS, fps)
+        ok = safe_set(cap, cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*pixel_format)) and ok
+    ok = safe_set(cap, cv2.CAP_PROP_BUFFERSIZE, 1) and ok
+    ok = safe_set(cap, cv2.CAP_PROP_FRAME_WIDTH, width) and ok
+    ok = safe_set(cap, cv2.CAP_PROP_FRAME_HEIGHT, height) and ok
+    ok = safe_set(cap, cv2.CAP_PROP_FPS, fps) and ok
+    return ok

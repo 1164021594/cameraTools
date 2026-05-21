@@ -1,14 +1,21 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
 import cv2
 import numpy as np
 
-from stereo_aruco_gui.app.aruco_board import common_board_points, create_board, detect_markers
+from stereo_aruco_gui.app.aruco_board import DetectionResult, board_object_map, common_board_points, detect_markers
 from stereo_aruco_gui.app.config import ArucoConfig
 from stereo_aruco_gui.app.storage import ImagePair, list_image_pairs, save_calibration_npz, save_calibration_yaml
+
+
+MIN_DETECTED_POINTS_PER_PAIR = 16
+MIN_CALIBRATION_POINTS_PER_PAIR = 40
+GOOD_STEREO_ERROR = 1.0
+CHECK_STEREO_ERROR = 3.0
 
 
 @dataclass
@@ -53,12 +60,173 @@ class StereoCalibrationResult:
         }
 
 
+@dataclass(frozen=True)
+class PairDetectionStats:
+    index: int
+    filename: str
+    readable: bool
+    left_markers: int
+    right_markers: int
+    common_points: int
+    valid: bool
+    status: str
+    reason: str
+
+
+@dataclass(frozen=True)
+class CalibrationPairPreview:
+    stats: PairDetectionStats
+    left_image: np.ndarray | None
+    right_image: np.ndarray | None
+    left_detection: DetectionResult | None
+    right_detection: DetectionResult | None
+
+
+@dataclass(frozen=True)
+class CalibrationDatasetReport:
+    total_pairs: int
+    readable_pairs: int
+    valid_pairs: int
+    image_size: tuple[int, int] | None
+    pair_stats: list[PairDetectionStats]
+
+    @property
+    def invalid_pairs(self) -> int:
+        return sum(1 for stats in self.pair_stats if stats.status == "INVALID")
+
+    @property
+    def weak_pairs(self) -> int:
+        return sum(1 for stats in self.pair_stats if stats.status == "WEAK")
+
+    @property
+    def invalid_filenames(self) -> list[str]:
+        return [stats.filename for stats in self.pair_stats if stats.status == "INVALID"]
+
+    @property
+    def weak_filenames(self) -> list[str]:
+        return [stats.filename for stats in self.pair_stats if stats.status == "WEAK"]
+
+    @property
+    def average_common_points(self) -> float:
+        if not self.pair_stats:
+            return 0.0
+        return float(sum(stats.common_points for stats in self.pair_stats) / len(self.pair_stats))
+
+
+def calibration_quality_label(stereo_error: float) -> str:
+    if stereo_error <= GOOD_STEREO_ERROR:
+        return "GOOD"
+    if stereo_error <= CHECK_STEREO_ERROR:
+        return "CHECK"
+    return "POOR"
+
+
+def pair_quality_status(
+    common_points: int,
+    min_detected_points: int = MIN_DETECTED_POINTS_PER_PAIR,
+    min_calibration_points: int = MIN_CALIBRATION_POINTS_PER_PAIR,
+) -> tuple[str, bool, str]:
+    if common_points < min_detected_points:
+        return "INVALID", False, f"Need {min_detected_points} common corners, found {common_points}"
+    if common_points < min_calibration_points:
+        return "WEAK", False, f"Weak pair: need {min_calibration_points} common corners for calibration, found {common_points}"
+    return "VALID", True, "OK"
+
+
+def analyze_calibration_pairs(
+    image_root: Path | str,
+    aruco_config: ArucoConfig,
+    min_points_per_pair: int = MIN_CALIBRATION_POINTS_PER_PAIR,
+    on_pair: Callable[[CalibrationPairPreview], None] | None = None,
+) -> CalibrationDatasetReport:
+    pairs = list_image_pairs(image_root)
+    board = board_object_map(aruco_config)
+    pair_stats: list[PairDetectionStats] = []
+    readable_pairs = 0
+    valid_pairs = 0
+    image_size: tuple[int, int] | None = None
+
+    for pair in pairs:
+        left_image = cv2.imread(str(pair.left_path))
+        right_image = cv2.imread(str(pair.right_path))
+        if left_image is None or right_image is None:
+            stats = PairDetectionStats(
+                index=pair.index,
+                filename=pair.left_path.name,
+                readable=False,
+                left_markers=0,
+                right_markers=0,
+                common_points=0,
+                valid=False,
+                status="INVALID",
+                reason="Unreadable image pair",
+            )
+            pair_stats.append(stats)
+            if on_pair is not None:
+                on_pair(CalibrationPairPreview(stats, left_image, right_image, None, None))
+            continue
+
+        readable_pairs += 1
+        current_size = (left_image.shape[1], left_image.shape[0])
+        right_size = (right_image.shape[1], right_image.shape[0])
+        if image_size is None:
+            image_size = current_size
+
+        if current_size != image_size or right_size != image_size:
+            stats = PairDetectionStats(
+                index=pair.index,
+                filename=pair.left_path.name,
+                readable=True,
+                left_markers=0,
+                right_markers=0,
+                common_points=0,
+                valid=False,
+                status="INVALID",
+                reason=f"Image size mismatch: left={current_size}, right={right_size}, expected={image_size}",
+            )
+            pair_stats.append(stats)
+            if on_pair is not None:
+                on_pair(CalibrationPairPreview(stats, left_image, right_image, None, None))
+            continue
+
+        left_detection = detect_markers(left_image, aruco_config)
+        right_detection = detect_markers(right_image, aruco_config)
+        obj, _, _ = common_board_points(board, left_detection, right_detection)
+        common_points = int(len(obj))
+        status, valid, reason = pair_quality_status(common_points, min_calibration_points=min_points_per_pair)
+        if valid:
+            valid_pairs += 1
+
+        stats = PairDetectionStats(
+            index=pair.index,
+            filename=pair.left_path.name,
+            readable=True,
+            left_markers=left_detection.count,
+            right_markers=right_detection.count,
+            common_points=common_points,
+            valid=valid,
+            status=status,
+            reason=reason,
+        )
+        pair_stats.append(stats)
+        if on_pair is not None:
+            on_pair(CalibrationPairPreview(stats, left_image, right_image, left_detection, right_detection))
+
+    return CalibrationDatasetReport(
+        total_pairs=len(pairs),
+        readable_pairs=readable_pairs,
+        valid_pairs=valid_pairs,
+        image_size=image_size,
+        pair_stats=pair_stats,
+    )
+
+
 def collect_calibration_points(
     pairs: list[ImagePair],
     aruco_config: ArucoConfig,
-    min_points_per_pair: int = 16,
+    min_points_per_pair: int = MIN_CALIBRATION_POINTS_PER_PAIR,
 ) -> tuple[list[np.ndarray], list[np.ndarray], list[np.ndarray], tuple[int, int], int]:
-    board = create_board(aruco_config)
+    board = board_object_map(aruco_config)
     all_obj_points: list[np.ndarray] = []
     all_left_points: list[np.ndarray] = []
     all_right_points: list[np.ndarray] = []
