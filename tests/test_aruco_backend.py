@@ -5,15 +5,26 @@ import os
 import numpy as np
 from PySide6.QtWidgets import QApplication
 
+import stereo_aruco_gui.app.barcode as barcode_module
 import stereo_aruco_gui.app.camera_worker as camera_worker_module
 import stereo_aruco_gui.app.main_window as main_window_module
+import stereo_aruco_gui.app.measurement_2d as measurement_2d_module
 import stereo_aruco_gui.app.rectification as rectification_module
 from stereo_aruco_gui.app.aruco_board import board_object_map, create_board, create_detector, dictionary_id
+from stereo_aruco_gui.app.barcode import (
+    BarcodeConfirmation,
+    BarcodeDetection,
+    barcode_formats_for_labels,
+    decode_barcodes,
+    draw_barcode_detections,
+)
 from stereo_aruco_gui.app.calibration import (
     CalibrationPairPreview,
+    MonoCalibrationResult,
     PairDetectionStats,
     StereoCalibrationResult,
     analyze_calibration_pairs,
+    calibrate_mono_from_images,
     calibration_quality_label,
     pair_quality_status,
 )
@@ -35,8 +46,15 @@ from stereo_aruco_gui.app.config import AppConfig
 from stereo_aruco_gui.app.config import ArucoConfig, load_config
 from stereo_aruco_gui.app.image_view import ImageView
 from stereo_aruco_gui.app.main_window import MainWindow, parse_resolution_label
+from stereo_aruco_gui.app.measurement_2d import plane_distance_between_pixels
 from stereo_aruco_gui.app.rectification import DisparityConfig, compute_disparity, distance_at, filtered_disparity_preview
-from stereo_aruco_gui.app.storage import delete_last_image_pair, list_image_pairs, save_image_pair
+from stereo_aruco_gui.app.storage import (
+    delete_last_image_pair,
+    list_image_pairs,
+    list_single_images,
+    save_image_pair,
+    save_single_image,
+)
 from stereo_aruco_gui.app.ui_state import camera_selection_warning, pair_count_text, view_mode_enabled
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -212,6 +230,90 @@ def test_preview_title_row_is_compact():
     assert right_title.maximumHeight() <= 22
 
 
+
+def test_barcode_formats_for_labels_maps_supported_types():
+    formats = barcode_formats_for_labels(["Code 39", "Code 128", "Codabar", "EAN", "ITF25", "Code 93", "QR Code", "DataMatrix"])
+
+    assert formats is not None
+
+
+def test_decode_barcodes_reads_generated_qrcode():
+    zxingcpp = barcode_module.require_zxingcpp()
+    barcode = zxingcpp.create_barcode("CAMERA-OK", zxingcpp.BarcodeFormat.QRCode)
+    image = np.array(zxingcpp.write_barcode_to_image(barcode, scale=4))
+
+    detections = decode_barcodes(image, enabled_labels=["QR Code"])
+
+    assert len(detections) == 1
+    assert detections[0].text == "CAMERA-OK"
+    assert detections[0].format == "QR Code"
+    assert detections[0].points is not None
+
+
+def test_barcode_confirmation_requires_repeated_same_result():
+    confirmation = BarcodeConfirmation(required_count=3)
+    detection = BarcodeDetection(text="ABC123", format="Code 128", points=None)
+
+    assert confirmation.update([detection]) is None
+    assert confirmation.update([detection]) is None
+
+    confirmed = confirmation.update([detection])
+
+    assert confirmed == detection
+    assert confirmation.status_text() == "ABC123 (Code 128) x3"
+
+
+def test_barcode_confirmation_resets_on_different_result():
+    confirmation = BarcodeConfirmation(required_count=2)
+    first = BarcodeDetection(text="ABC123", format="Code 128", points=None)
+    second = BarcodeDetection(text="XYZ999", format="Code 128", points=None)
+
+    assert confirmation.update([first]) is None
+    assert confirmation.update([second]) is None
+
+    confirmed = confirmation.update([second])
+
+    assert confirmed == second
+    assert confirmation.status_text() == "XYZ999 (Code 128) x2"
+
+
+def test_barcode_detection_view_shows_controls_without_requiring_calibration():
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow(load_config())
+    window.show()
+    app.processEvents()
+
+    window.view_mode.setCurrentText("Barcode Detection")
+
+    assert app is not None
+    assert window.calibration_group.isVisible() is False
+    assert window.depth_group.isVisible() is False
+    assert window.measurement_2d_group.isVisible() is False
+    assert window.barcode_group.isVisible() is True
+
+
+def test_barcode_detection_updates_preview_and_confirmed_result(monkeypatch):
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow(load_config())
+    window.view_mode.setCurrentText("Barcode Detection")
+    window.barcode_confirm_frames.setValue(1)
+    detection = BarcodeDetection(text="ABC123", format="Code 128", points=((2, 2), (8, 2), (8, 8), (2, 8)))
+
+    monkeypatch.setattr(main_window_module, "decode_barcodes", lambda frame, enabled_labels: [detection])
+
+    frame = np.zeros((16, 16, 3), dtype=np.uint8)
+    window._update_frames(frame, None)
+
+    assert app is not None
+    assert window.distance_state.text() == "Barcode: ABC123"
+    assert "Barcode confirmed: ABC123 (Code 128)" in window.status_box.toPlainText()
+    assert window.left_view._last_frame is not None
+    assert np.array_equal(window.left_view._last_frame[2, 2], np.array([0, 255, 0], dtype=np.uint8))
+
+
+def test_view_mode_enabled_allows_barcode_detection_without_calibration():
+    assert view_mode_enabled("Barcode Detection", has_calibration=False) is True
+
 def test_depth_view_replaces_calibration_controls_with_depth_parameters():
     app = QApplication.instance() or QApplication([])
     window = MainWindow(load_config())
@@ -232,6 +334,66 @@ def test_depth_view_replaces_calibration_controls_with_depth_parameters():
 
     assert window.calibration_group.isVisible() is True
     assert window.depth_group.isVisible() is False
+
+
+def test_2d_measurement_view_shows_controls_without_requiring_stereo_calibration():
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow(load_config())
+    window.show()
+    app.processEvents()
+
+    window.view_mode.setCurrentText("2D Measurement")
+
+    assert app is not None
+    assert window.calibration_group.isVisible() is False
+    assert window.depth_group.isVisible() is False
+    assert window.measurement_2d_group.isVisible() is True
+
+
+def test_2d_measurement_clicks_two_points_and_reports_distance(monkeypatch, tmp_path):
+    app = QApplication.instance() or QApplication([])
+    config = load_config()
+    config.output.dir = str(tmp_path / "output")
+    window = MainWindow(config)
+    window.view_mode.setCurrentText("2D Measurement")
+    window.plane_distance_mm.setValue(500.0)
+    window.mono_calibration = {"K": np.eye(3), "D": np.zeros((1, 5))}
+
+    def fake_distance(p1, p2, K, D, plane_distance_mm):  # noqa: ANN001
+        assert p1 == (10, 20)
+        assert p2 == (110, 20)
+        assert plane_distance_mm == 500.0
+        return 42.5
+
+    monkeypatch.setattr(main_window_module, "plane_distance_between_pixels", fake_distance)
+
+    window._handle_preview_click("left", 10, 20)
+    window._handle_preview_click("left", 110, 20)
+
+    assert app is not None
+    assert window.distance_state.text() == "2D: 42.50 mm"
+    assert "2D distance=42.50 mm" in window.status_box.toPlainText()
+
+
+def test_load_mono_calibration_loads_mono_file_without_stereo_rectifier(monkeypatch, tmp_path):
+    app = QApplication.instance() or QApplication([])
+    config = load_config()
+    config.output.dir = str(tmp_path / "output")
+    window = MainWindow(config)
+
+    monkeypatch.setattr(
+        main_window_module,
+        "load_mono_calibration_npz",
+        lambda output_dir: {"calibration_type": np.array("mono"), "K": np.eye(3), "D": np.zeros((1, 5))},
+    )
+
+    window._load_mono_calibration()
+
+    assert app is not None
+    assert window.rectifier is None
+    assert window.mono_calibration is not None
+    assert window.calibration_state.text() == "Calibration: mono loaded"
+    assert "Loaded mono calibration" in window.status_box.toPlainText()
 
 
 def test_depth_parameters_are_read_dynamically_for_each_disparity_frame(monkeypatch):
@@ -445,6 +607,22 @@ def test_distance_at_uses_local_median_when_center_pixel_is_invalid():
     assert distance_at(disparity, q, 4, 4, window_size=5) == 1.0
 
 
+def test_plane_distance_between_pixels_uses_mono_intrinsics_and_plane_z():
+    K = np.array(
+        [
+            [500.0, 0.0, 320.0],
+            [0.0, 500.0, 240.0],
+            [0.0, 0.0, 1.0],
+        ],
+        dtype=np.float32,
+    )
+    D = np.zeros((1, 5), dtype=np.float32)
+
+    distance = plane_distance_between_pixels((320, 240), (420, 240), K, D, plane_distance_mm=500.0)
+
+    assert distance == 100.0
+
+
 def test_calibration_review_controls_start_disabled():
     app = QApplication.instance() or QApplication([])
     window = MainWindow(load_config())
@@ -610,6 +788,36 @@ def test_calibration_quality_label_marks_large_error_as_poor():
     assert calibration_quality_label(12.0) == "POOR"
 
 
+def test_calibrate_mono_from_images_saves_mono_files_separate_from_stereo(monkeypatch, tmp_path):
+    frame = np.full((32, 40, 3), 80, dtype=np.uint8)
+    save_single_image(tmp_path / "images", frame)
+    obj = np.zeros((40, 3), dtype=np.float32)
+    pts = np.zeros((40, 2), dtype=np.float32)
+
+    monkeypatch.setattr(
+        "stereo_aruco_gui.app.calibration.collect_mono_calibration_points",
+        lambda image_root, aruco_config: ([obj], [pts], (40, 32), 1),
+    )
+
+    def fake_calibrate(obj_points, image_points, image_size, camera_matrix, dist_coeffs):  # noqa: ANN001
+        return 0.75, np.eye(3), np.zeros((1, 5)), [], []
+
+    monkeypatch.setattr("stereo_aruco_gui.app.calibration.cv2.calibrateCamera", fake_calibrate)
+
+    result = calibrate_mono_from_images(tmp_path / "images", tmp_path / "output", ArucoConfig(), min_valid_images=1)
+
+    assert result.error == 0.75
+    assert result.image_size == (40, 32)
+    assert result.valid_images == 1
+    np.testing.assert_allclose(result.K, np.eye(3))
+    np.testing.assert_allclose(result.D, np.zeros((1, 5)))
+    assert (tmp_path / "output" / "mono_calib.npz").exists()
+    assert (tmp_path / "output" / "mono_calib.yaml").exists()
+    assert not (tmp_path / "output" / "stereo_calib.npz").exists()
+    with np.load(tmp_path / "output" / "mono_calib.npz") as data:
+        assert data["calibration_type"] == "mono"
+
+
 def test_pair_quality_status_marks_weak_pairs_but_excludes_them_from_calibration():
     assert pair_quality_status(8) == ("INVALID", False, "Need 16 common corners, found 8")
     assert pair_quality_status(28) == ("WEAK", False, "Weak pair: need 40 common corners for calibration, found 28")
@@ -734,6 +942,19 @@ def test_save_and_list_image_pair(tmp_path):
     assert pair.left_path.exists()
     assert pair.right_path.exists()
     assert len(pairs) == 1
+
+
+def test_save_and_list_single_images_use_separate_directory(tmp_path):
+    frame = np.full((24, 32, 3), 80, dtype=np.uint8)
+
+    image = save_single_image(tmp_path, frame)
+    images = list_single_images(tmp_path)
+
+    assert image.index == 1
+    assert image.path == tmp_path / "single" / "0001.png"
+    assert image.path.exists()
+    assert images == [image]
+    assert list_image_pairs(tmp_path) == []
 
 
 def test_delete_last_image_pair_removes_highest_index_pair(tmp_path):
@@ -1206,6 +1427,58 @@ def test_original_view_buttons_require_frames():
 
     assert app is not None
     assert "No left frame available" in window.status_box.toPlainText()
+
+
+def test_single_camera_capture_saves_single_image_separate_from_pairs(tmp_path):
+    app = QApplication.instance() or QApplication([])
+    config = load_config()
+    config.capture.output_dir = str(tmp_path / "images")
+    window = MainWindow(config)
+    frame = np.full((20, 20, 3), 90, dtype=np.uint8)
+    window.single_mode.setChecked(True)
+    window.latest_left = frame
+    window.latest_right = None
+
+    window._capture_pair()
+
+    assert app is not None
+    assert len(list_single_images(config.capture.output_dir)) == 1
+    assert list_image_pairs(config.capture.output_dir) == []
+    assert "Saved single image 0001" in window.status_box.toPlainText()
+
+
+def test_single_camera_calibrate_uses_mono_output_without_stereo_rectifier(monkeypatch, tmp_path):
+    app = QApplication.instance() or QApplication([])
+    config = load_config()
+    config.capture.output_dir = str(tmp_path / "images")
+    config.output.dir = str(tmp_path / "output")
+    window = MainWindow(config)
+    window.single_mode.setChecked(True)
+    result = MonoCalibrationResult(
+        error=0.55,
+        image_size=(40, 32),
+        K=np.eye(3),
+        D=np.zeros((1, 5)),
+        valid_images=18,
+    )
+    called = {}
+
+    def fake_calibrate_mono(image_root, output_dir, aruco_config):  # noqa: ANN001
+        called["image_root"] = image_root
+        called["output_dir"] = output_dir
+        return result
+
+    monkeypatch.setattr(main_window_module, "calibrate_mono_from_images", fake_calibrate_mono)
+
+    window._calibrate()
+
+    assert app is not None
+    assert called == {"image_root": config.capture.output_dir, "output_dir": config.output.dir}
+    assert window.rectifier is None
+    assert window.calibration_state.text() == "Calibration: mono error 0.5500"
+    assert window.baseline_state.text() == "Baseline: mono N/A"
+    assert window.output_path_label.text().endswith("mono_calib.npz")
+    assert "Mono calibration done" in window.status_box.toPlainText()
 
 
 def test_stop_cameras_keeps_running_worker_until_finished():

@@ -40,6 +40,111 @@ AprilTag 36h11 检测时使用 `markerBorderBits = 2`。如果这个值不对，
 6. `cv2.stereoRectify()` 生成 `R1`、`R2`、`P1`、`P2`、`Q`。
 7. 标定结果保存到 `data/output/stereo_calib.npz` 和 `data/output/stereo_calib.yaml`。
 
+## 单摄标定
+
+单摄模式现在也支持标定，但它和双目标定完全分开：
+
+- 单摄图片保存到 `data/images/single/`。
+- 单摄标定输出保存为 `data/output/mono_calib.npz` 和 `data/output/mono_calib.yaml`。
+- 双摄图片仍保存到 `data/images/left/` 和 `data/images/right/`。
+- 双目标定输出仍保存为 `data/output/stereo_calib.npz` 和 `data/output/stereo_calib.yaml`。
+
+单摄标定只会得到：
+
+- `K`: 单个相机内参
+- `D`: 单个相机畸变
+- `error`: 单目标定重投影误差
+- `image_size`: 标定图像尺寸
+
+单摄标定不会得到双目基线 `T`，也不会生成 `Q` 矩阵，所以不能用于 `Depth / Distance` 双目测距。它适合用于：
+
+- 获取单个相机内参。
+- 检查镜头畸变。
+- 给单相机图像做去畸变。
+- 在做双目标定前，单独确认某个摄像头和标定板参数是否正常。
+
+使用方式：
+
+1. 勾选 `Single camera mode`。
+2. 打开摄像头。
+3. 点击 `Capture Pair`，此时会保存单摄图片到 `single/` 目录。
+4. 拍摄多张不同姿态、不同位置、不同距离的标定板图片。
+5. 点击 `Start Calibration`，软件会执行单目标定并输出 `mono_calib.*`。
+
+注意：单摄标定完成后，软件不会创建 `Rectifier`，也不会启用双目深度计算。需要深度测距时，必须退出单摄模式，采集左右图像对并生成 `stereo_calib.*`。
+
+## 2D 平面测距
+
+`2D Measurement` 模式用于单相机平面测距，不使用双目的视差深度。它依赖单目标定输出：
+
+- 标定文件：`data/output/mono_calib.npz`
+- 使用参数：`K` 和 `D`
+- 手动输入：`Plane distance mm`
+
+`Plane distance mm` 表示相机到被测平面的垂直工作距离，单位是 `mm`。如果下一次测试时相机高度变了，只要相机本身、镜头焦距、分辨率没有变化，不需要重新做内参标定，但必须把这个工作距离改成新的真实距离。
+
+当前实现假设被测平面与相机成像平面平行，暂时不做倾斜角补偿。如果相机相对被测平面有明显倾斜，测出来的 2D 距离会有系统误差。
+
+软件计算流程：
+
+1. 在 `2D Measurement` 模式点击 `Load Mono Calibration`，加载 `mono_calib.npz`。
+2. 在 `Plane distance mm` 输入相机到被测平面的垂直距离。
+3. 在预览图或原图窗口中点击两个点。
+4. 软件先用 `cv2.undistortPoints()` 根据 `K`、`D` 去畸变，并得到归一化相机坐标。
+5. 用输入的工作距离 `Z` 把归一化坐标换算到平面上的毫米坐标。
+6. 计算两点的欧氏距离，底部显示 `2D: xx.xx mm`。
+
+核心关系可以理解为：
+
+```text
+X = x_norm * Z
+Y = y_norm * Z
+distance = sqrt((X2 - X1)^2 + (Y2 - Y1)^2)
+```
+
+其中 `x_norm`、`y_norm` 是去畸变后的归一化坐标，`Z` 就是界面里输入的 `Plane distance mm`。
+
+这个功能适合测量同一个平面上的孔距、边长、间距等二维尺寸。不要把它当成双目深度测距使用；它不能自动知道物体高度，也不能在不同深度的多个平面之间自动测距。
+
+## 条码识别
+
+`Barcode Detection` 模式用于从当前摄像头画面中解码条码。当前软件使用 `zxing-cpp`，支持：
+
+- `Code 39`
+- `Code 128`
+- `Codabar`
+- `EAN`
+- `ITF25`
+- `Code 93`
+- `QR Code`
+- `DataMatrix`
+
+使用方式：
+
+1. 打开摄像头。
+2. View 切换到 `Barcode Detection`。
+3. `Type` 选择预期条码类型；不知道类型时可以用 `All`。
+4. `Confirm frames` 设置连续确认帧数，默认 `3`。
+5. 条码连续识别到相同内容后，底部显示 `Barcode: xxx`，状态栏打印 `Barcode confirmed`。
+
+稳定性逻辑：
+
+- 解码逻辑在 `barcode.py` 中独立实现，输入是 OpenCV 图像帧 `np.ndarray`。后面接网络工业相机时，只要能拿到图像帧，就可以复用这套解码逻辑。
+- 同一个条码内容和格式连续出现多帧后才确认，减少单帧误识别。
+- 预览图会用绿色框标出识别到的条码位置。
+- 如果没有安装 `zxing-cpp`，软件不会崩溃，而是在界面提示重新执行 `python -m pip install -r requirements.txt`。
+
+为了提高稳定解码率，优先保证：
+
+- 条码清晰对焦。
+- 不要过曝，白底不能一片死白。
+- 一维码最细条宽在图像中至少有数个像素。
+- QR Code 和 DataMatrix 的最小模块在图像中至少有数个像素。
+- 尽量固定曝光、增益和光源。
+- 现场使用时优先选择具体条码类型，少用 `All`，这样更快，也能减少误识别。
+
+注意：软件解码可以先支持当前 USB 摄像头调试，但长期工业现场建议使用定焦工业相机、合适镜头、稳定光源和固定安装结构。后续接入网络工业摄像头时，应把相机取流作为新的帧来源，条码解码模块不需要重写。
+
 ## 标定图片质量判断
 
 软件现在把每组图片分成三类：

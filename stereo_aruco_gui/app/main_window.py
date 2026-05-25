@@ -27,11 +27,20 @@ from PySide6.QtWidgets import (
 )
 
 from stereo_aruco_gui.app.aruco_board import ARUCO_DICTIONARIES, detect_markers, draw_detection
+from stereo_aruco_gui.app.barcode import (
+    SUPPORTED_BARCODE_LABELS,
+    BarcodeConfirmation,
+    BarcodeDetection,
+    decode_barcodes,
+    draw_barcode_detections,
+)
 from stereo_aruco_gui.app.calibration import (
     CalibrationDatasetReport,
     CalibrationPairPreview,
+    MonoCalibrationResult,
     StereoCalibrationResult,
     analyze_calibration_pairs,
+    calibrate_mono_from_images,
     calibrate_from_pairs,
     calibration_quality_label,
 )
@@ -39,6 +48,7 @@ from stereo_aruco_gui.app.camera_probe import scan_camera_indices
 from stereo_aruco_gui.app.camera_worker import BACKEND_MAP, PIXEL_FORMATS, SingleCameraWorker, preview_copy
 from stereo_aruco_gui.app.config import AppConfig, ArucoConfig, CameraConfig, save_config
 from stereo_aruco_gui.app.image_view import ImageView
+from stereo_aruco_gui.app.measurement_2d import plane_distance_between_pixels
 from stereo_aruco_gui.app.original_image_dialog import OriginalImageDialog
 from stereo_aruco_gui.app.rectification import (
     DisparityConfig,
@@ -50,7 +60,14 @@ from stereo_aruco_gui.app.rectification import (
     filtered_disparity_preview,
     draw_horizontal_guides,
 )
-from stereo_aruco_gui.app.storage import delete_last_image_pair, list_image_pairs, load_calibration_npz, save_image_pair
+from stereo_aruco_gui.app.storage import (
+    delete_last_image_pair,
+    list_image_pairs,
+    load_calibration_npz,
+    load_mono_calibration_npz,
+    save_image_pair,
+    save_single_image,
+)
 from stereo_aruco_gui.app.ui_state import camera_selection_warning, pair_count_text, view_mode_enabled
 
 
@@ -65,7 +82,14 @@ RESOLUTION_OPTIONS = (
 )
 DEFAULT_RESOLUTION = (1280, 960)
 
-VIEW_MODES = ("Live Preview", "ArUco Detection", "Rectified Preview", "Depth / Distance")
+VIEW_MODES = (
+    "Live Preview",
+    "ArUco Detection",
+    "Rectified Preview",
+    "Depth / Distance",
+    "2D Measurement",
+    "Barcode Detection",
+)
 BACKEND_OPTIONS = ("AUTO", *BACKEND_MAP.keys())
 DEPTH_PRESETS = {
     "Balanced": DisparityConfig(),
@@ -109,6 +133,11 @@ class MainWindow(QMainWindow):
         self.frozen_right: np.ndarray | None = None
         self._freeze_enabled = False
         self.rectifier: Rectifier | None = None
+        self.mono_calibration: dict[str, np.ndarray] | None = None
+        self.measurement_2d_points: list[tuple[int, int]] = []
+        self.barcode_confirmation = BarcodeConfirmation(required_count=3)
+        self.latest_barcode_detections: list[BarcodeDetection] = []
+        self._last_confirmed_barcode_key: tuple[str, str] | None = None
         self.latest_disparity: np.ndarray | None = None
         self._opening_labels: set[str] = set()
         self._original_dialogs: list[OriginalImageDialog] = []
@@ -149,9 +178,15 @@ class MainWindow(QMainWindow):
         controls.addWidget(self._capture_group())
         self.calibration_group = self._calibration_group()
         self.depth_group = self._depth_group()
+        self.measurement_2d_group = self._measurement_2d_group()
+        self.barcode_group = self._barcode_group()
         self.depth_group.hide()
+        self.measurement_2d_group.hide()
+        self.barcode_group.hide()
         controls.addWidget(self.calibration_group)
         controls.addWidget(self.depth_group)
+        controls.addWidget(self.measurement_2d_group)
+        controls.addWidget(self.barcode_group)
         controls.addWidget(self._ranging_group())
         controls.addWidget(self._diagnostics_group())
         controls.addStretch(1)
@@ -356,6 +391,42 @@ class MainWindow(QMainWindow):
         hint = QLabel("Changes apply to the next depth frame.")
         hint.setWordWrap(True)
         form.addRow("", hint)
+        return group
+
+    def _measurement_2d_group(self) -> QGroupBox:
+        group = QGroupBox("3. 2D Measurement")
+        form = QFormLayout(group)
+        self.plane_distance_mm = QDoubleSpinBox()
+        self.plane_distance_mm.setRange(1.0, 100000.0)
+        self.plane_distance_mm.setDecimals(2)
+        self.plane_distance_mm.setSingleStep(10.0)
+        self.plane_distance_mm.setValue(500.0)
+        self.load_mono_button = QPushButton("Load Mono Calibration")
+        self.load_mono_button.clicked.connect(self._load_mono_calibration)
+        self.clear_measurement_2d_button = QPushButton("Clear 2D Points")
+        self.clear_measurement_2d_button.clicked.connect(self._clear_2d_measurement)
+        self.measurement_2d_info = QLabel("Load mono calibration, enter plane distance, then click two points.")
+        self.measurement_2d_info.setWordWrap(True)
+        form.addRow("Plane distance mm", self.plane_distance_mm)
+        form.addRow(self.load_mono_button, self.clear_measurement_2d_button)
+        form.addRow("Result", self.measurement_2d_info)
+        return group
+
+    def _barcode_group(self) -> QGroupBox:
+        group = QGroupBox("3. Barcode Detection")
+        form = QFormLayout(group)
+        self.barcode_format = QComboBox()
+        self.barcode_format.addItems(("All", *SUPPORTED_BARCODE_LABELS))
+        self.barcode_format.setCurrentText("All")
+        self.barcode_confirm_frames = self._spin(1, 20, 3)
+        self.barcode_info = QLabel("Select barcode type and show a barcode in the left/current camera view.")
+        self.barcode_info.setWordWrap(True)
+        self.clear_barcode_button = QPushButton("Clear Barcode Result")
+        self.clear_barcode_button.clicked.connect(self._clear_barcode_result)
+        form.addRow("Type", self.barcode_format)
+        form.addRow("Confirm frames", self.barcode_confirm_frames)
+        form.addRow("", self.clear_barcode_button)
+        form.addRow("Result", self.barcode_info)
         return group
 
     def _ranging_group(self) -> QGroupBox:
@@ -629,14 +700,19 @@ class MainWindow(QMainWindow):
             self.latest_right = right
         freeze_preview = freeze_preview or self._freeze_enabled
         show_left, show_right = left, right
+        mode = self.view_mode.currentText()
         if right is None:
+            if mode == "2D Measurement":
+                show_left = self._draw_2d_measurement_overlay(show_left)
+            elif mode == "Barcode Detection":
+                show_left = self._process_barcode_frame(show_left)
             left_preview = preview_copy(show_left)
             self.left_view.set_frame(left_preview)
             self.left_view.set_source_size(show_left.shape[1], show_left.shape[0])
             self.right_view.setText("Single camera mode")
-            self.preview_info.setText("Frozen Preview" if freeze_preview else "Live Preview")
+            single_preview_mode = mode if mode in ("2D Measurement", "Barcode Detection") else "Live Preview"
+            self.preview_info.setText("Frozen Preview" if freeze_preview else single_preview_mode)
             return
-        mode = self.view_mode.currentText()
         if not view_mode_enabled(mode, self.rectifier is not None):
             self.preview_info.setText("Calibration required")
             self.latest_disparity = None
@@ -674,6 +750,12 @@ class MainWindow(QMainWindow):
             show_right = draw_depth_roi(right_rect, valid_x)
             if self.guides_check.isChecked():
                 show_right = draw_horizontal_guides(show_right)
+        elif mode == "2D Measurement":
+            show_left = self._draw_2d_measurement_overlay(show_left)
+            self.latest_disparity = None
+        elif mode == "Barcode Detection":
+            show_left = self._process_barcode_frame(show_left)
+            self.latest_disparity = None
         else:
             self.latest_disparity = None
         left_preview = preview_copy(show_left)
@@ -757,7 +839,15 @@ class MainWindow(QMainWindow):
 
     def _capture_pair(self) -> None:
         if self.single_mode.isChecked():
-            self._log("Single camera mode is for preview testing only; pair capture is disabled")
+            if self.latest_left is None:
+                self._log("No camera frames available")
+                return
+            try:
+                image = save_single_image(self.config.capture.output_dir, self.latest_left)
+                self.last_pair_label.setText(f"Last single: {image.path.name}")
+                self._log(f"Saved single image {image.index:04d}")
+            except Exception as exc:  # noqa: BLE001
+                self._error(str(exc))
             return
         if self.latest_left is None or self.latest_right is None:
             self._log("No camera frames available")
@@ -787,7 +877,7 @@ class MainWindow(QMainWindow):
 
     def _calibrate(self) -> None:
         if self.single_mode.isChecked():
-            self._log("Disable single camera mode before stereo calibration")
+            self._calibrate_mono()
             return
         was_preview_running = self.preview_timer.isActive()
         try:
@@ -845,6 +935,50 @@ class MainWindow(QMainWindow):
             self.load_button.setEnabled(True)
             if was_preview_running and self._any_camera_worker_running():
                 self.preview_timer.start()
+
+    def _calibrate_mono(self) -> None:
+        was_preview_running = self.preview_timer.isActive()
+        try:
+            aruco = self._current_aruco_config()
+            self.calibrate_button.setEnabled(False)
+            self.load_button.setEnabled(False)
+            if was_preview_running:
+                self.preview_timer.stop()
+            self._log("Mono calibration started")
+            self._log(
+                "Board: "
+                f"{aruco.dictionary}, {aruco.markers_x}x{aruco.markers_y}, "
+                f"tag={aruco.marker_length_m:.3f} m, spacing={aruco.marker_separation_m:.3f} m, "
+                f"mirror_x={aruco.board_mirror_x}"
+            )
+            result = calibrate_mono_from_images(
+                self.config.capture.output_dir,
+                self.config.output.dir,
+                aruco,
+            )
+            self._show_mono_calibration_result(result)
+        except Exception as exc:  # noqa: BLE001
+            self._error(str(exc))
+        finally:
+            self.calibrate_button.setEnabled(True)
+            self.load_button.setEnabled(True)
+            if was_preview_running and self._any_camera_worker_running():
+                self.preview_timer.start()
+
+    def _show_mono_calibration_result(self, result: MonoCalibrationResult) -> None:
+        self.rectifier = None
+        self.latest_disparity = None
+        self.mono_calibration = result.as_dict()
+        self.calibration_metrics.setText(f"Mono images {result.valid_images} | error {result.error:.4f}")
+        self.calibration_state.setText(f"Calibration: mono error {result.error:.4f}")
+        self.baseline_state.setText("Baseline: mono N/A")
+        self.output_path_label.setText(f"{Path(self.config.output.dir) / 'mono_calib.npz'}")
+        self._log(
+            "Mono calibration done\n"
+            f"valid images: {result.valid_images}\n"
+            f"error: {result.error:.4f}\n"
+            f"output: {Path(self.config.output.dir) / 'mono_calib.npz'}"
+        )
 
     def _show_calibration_progress(self, preview: CalibrationPairPreview, total_pairs: int) -> None:
         self._last_calibration_preview = preview
@@ -1004,6 +1138,56 @@ class MainWindow(QMainWindow):
             y += line_gap
         return output
 
+    def _draw_2d_measurement_overlay(self, image: np.ndarray) -> np.ndarray:
+        if not self.measurement_2d_points:
+            return image
+        output = image.copy()
+        color = (0, 255, 0)
+        points = list(self.measurement_2d_points[:2])
+        if len(points) == 2:
+            cv2.line(output, points[0], points[1], color, 2, cv2.LINE_AA)
+        for index, point in enumerate(points, start=1):
+            cv2.circle(output, point, 5, color, -1, cv2.LINE_AA)
+            cv2.putText(
+                output,
+                f"P{index}",
+                (point[0] + 8, point[1] - 8),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.55,
+                color,
+                2,
+                cv2.LINE_AA,
+            )
+        return output
+
+    def _process_barcode_frame(self, image: np.ndarray) -> np.ndarray:
+        try:
+            detections = decode_barcodes(image, self._enabled_barcode_labels())
+        except Exception as exc:  # noqa: BLE001
+            self.latest_barcode_detections = []
+            self.barcode_info.setText(str(exc))
+            self._set_diagnostic(str(exc))
+            return image
+        self.latest_barcode_detections = detections
+        self.barcode_confirmation.required_count = max(1, self.barcode_confirm_frames.value())
+        confirmed = self.barcode_confirmation.update(detections)
+        if confirmed is None:
+            self.barcode_info.setText(self.barcode_confirmation.status_text())
+        else:
+            key = (confirmed.text, confirmed.format)
+            self.barcode_info.setText(f"{confirmed.text} ({confirmed.format})")
+            self.distance_state.setText(f"Barcode: {confirmed.text}")
+            if key != self._last_confirmed_barcode_key:
+                self._log(f"Barcode confirmed: {confirmed.text} ({confirmed.format})")
+                self._last_confirmed_barcode_key = key
+        return draw_barcode_detections(image, detections)
+
+    def _enabled_barcode_labels(self) -> list[str]:
+        current = self.barcode_format.currentText()
+        if current == "All":
+            return list(SUPPORTED_BARCODE_LABELS)
+        return [current]
+
     def _load_calibration(self) -> None:
         try:
             data = load_calibration_npz(self.config.output.dir)
@@ -1014,6 +1198,21 @@ class MainWindow(QMainWindow):
         except Exception as exc:  # noqa: BLE001
             self._error(str(exc))
 
+    def _load_mono_calibration(self) -> None:
+        try:
+            data = load_mono_calibration_npz(self.config.output.dir)
+            if "K" not in data or "D" not in data:
+                raise ValueError("mono_calib.npz must contain K and D")
+            self.rectifier = None
+            self.latest_disparity = None
+            self.mono_calibration = data
+            self.calibration_state.setText("Calibration: mono loaded")
+            self.baseline_state.setText("Baseline: mono N/A")
+            self.output_path_label.setText(f"{Path(self.config.output.dir) / 'mono_calib.npz'}")
+            self._log(f"Loaded mono calibration from {Path(self.config.output.dir) / 'mono_calib.npz'}")
+        except Exception as exc:  # noqa: BLE001
+            self._error(str(exc))
+
     def _set_rectifier_from_result(self, result: StereoCalibrationResult) -> None:
         self.rectifier = Rectifier.from_calibration({k: v for k, v in result.as_dict().items() if isinstance(v, np.ndarray) or k == "image_size"})
 
@@ -1021,6 +1220,9 @@ class MainWindow(QMainWindow):
         self._handle_preview_click("preview", x, y)
 
     def _handle_preview_click(self, side: str, x: int, y: int) -> None:
+        if self.view_mode.currentText() == "2D Measurement":
+            self._handle_2d_measurement_click(side, x, y)
+            return
         if self.view_mode.currentText() != "Depth / Distance" or self.rectifier is None or self.latest_disparity is None:
             self._log(f"Clicked {side} image point x={x}, y={y}")
             self.distance_state.setText(f"Point: {side} {x}, {y}")
@@ -1032,6 +1234,49 @@ class MainWindow(QMainWindow):
         else:
             self._log(f"x={x}, y={y}: distance={distance:.3f} m")
             self.distance_state.setText(f"Distance: {distance:.3f} m")
+
+    def _handle_2d_measurement_click(self, side: str, x: int, y: int) -> None:
+        if self.mono_calibration is None:
+            self._log("Load mono calibration before 2D measurement")
+            self.distance_state.setText("2D: load mono calibration")
+            self.measurement_2d_info.setText("Load mono calibration first.")
+            return
+        if len(self.measurement_2d_points) >= 2:
+            self.measurement_2d_points.clear()
+        point = (int(x), int(y))
+        self.measurement_2d_points.append(point)
+        if len(self.measurement_2d_points) == 1:
+            self.distance_state.setText(f"2D P1: {point[0]}, {point[1]}")
+            self.measurement_2d_info.setText(f"P1 {point}; click second point.")
+            self._log(f"2D point 1 on {side}: x={point[0]}, y={point[1]}")
+            return
+        p1, p2 = self.measurement_2d_points
+        distance_mm = plane_distance_between_pixels(
+            p1,
+            p2,
+            self.mono_calibration["K"],
+            self.mono_calibration["D"],
+            self.plane_distance_mm.value(),
+        )
+        self.distance_state.setText(f"2D: {distance_mm:.2f} mm")
+        self.measurement_2d_info.setText(
+            f"P1 {p1}, P2 {p2}, Z={self.plane_distance_mm.value():.2f} mm, distance={distance_mm:.2f} mm"
+        )
+        self._log(f"P1={p1}, P2={p2}, Z={self.plane_distance_mm.value():.2f} mm: 2D distance={distance_mm:.2f} mm")
+
+    def _clear_2d_measurement(self) -> None:
+        self.measurement_2d_points.clear()
+        self.distance_state.setText("2D: --")
+        self.measurement_2d_info.setText("Click two points on the same plane.")
+        self._log("Cleared 2D measurement points")
+
+    def _clear_barcode_result(self) -> None:
+        self.barcode_confirmation.reset()
+        self.latest_barcode_detections = []
+        self._last_confirmed_barcode_key = None
+        self.distance_state.setText("Barcode: --")
+        self.barcode_info.setText("No barcode")
+        self._log("Cleared barcode result")
 
     def _save_current_config(self) -> None:
         self.config.camera = self._current_camera_config()
@@ -1089,8 +1334,12 @@ class MainWindow(QMainWindow):
             self.view_mode.setCurrentText("Live Preview")
             return
         depth_mode = mode == "Depth / Distance"
-        self.calibration_group.setVisible(not depth_mode)
+        measurement_mode = mode == "2D Measurement"
+        barcode_mode = mode == "Barcode Detection"
+        self.calibration_group.setVisible(not depth_mode and not measurement_mode and not barcode_mode)
         self.depth_group.setVisible(depth_mode)
+        self.measurement_2d_group.setVisible(measurement_mode)
+        self.barcode_group.setVisible(barcode_mode)
         self.preview_info.setText(mode)
 
     def _refresh_diagnostics(self) -> None:

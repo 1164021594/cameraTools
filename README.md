@@ -26,9 +26,17 @@ python -m stereo_aruco_gui.main
 6. Capture 30-60 varied pairs across center, edges, near, middle, far, and tilted poses.
 7. Click `Start Calibration`.
 8. Use `Rectified Preview` mode to check that corresponding points lie on the same horizontal line.
-9. Use `Depth / Distance` mode and click the image to inspect distance after calibration.
+9. Use `Depth / Distance` mode and click the image to inspect stereo depth after stereo calibration.
+10. Use `2D Measurement` mode with `mono_calib.npz`, manually enter `Plane distance mm`, then click two image points to measure distance on that plane.
+11. Use `Barcode Detection` mode to decode Code 39, Code 128, Codabar, EAN, ITF25, Code 93, QR Code, and DataMatrix from the current camera view.
 
 Captured images are saved under `data/images`. Calibration output is saved under `data/output`.
+
+Single-camera mode can also capture and calibrate one camera. Single-camera images are saved under `data/images/single`, and the output is saved separately as `data/output/mono_calib.npz` and `data/output/mono_calib.yaml`. Monocular calibration does not produce stereo baseline or `Q`, so it cannot be used for `Depth / Distance`.
+
+`2D Measurement` uses the monocular `K` and `D` from `mono_calib.npz`. The `Plane distance mm` value is the vertical working distance from the camera to the measured plane. This mode assumes the measured plane is parallel to the camera image plane; tilt compensation is not included yet.
+
+`Barcode Detection` uses `zxing-cpp`. If this mode reports that the dependency is missing, run `python -m pip install -r requirements.txt`. For stable decoding, select the expected barcode type instead of `All` when possible, keep the barcode in focus, avoid overexposure, and make sure the smallest bars/modules occupy several pixels.
 
 ## Calibration Board
 

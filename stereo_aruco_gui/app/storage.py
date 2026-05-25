@@ -15,6 +15,12 @@ class ImagePair:
     right_path: Path
 
 
+@dataclass(frozen=True)
+class SingleImage:
+    index: int
+    path: Path
+
+
 def ensure_image_dirs(root: Path | str) -> tuple[Path, Path]:
     base = Path(root)
     left = base / "left"
@@ -22,6 +28,12 @@ def ensure_image_dirs(root: Path | str) -> tuple[Path, Path]:
     left.mkdir(parents=True, exist_ok=True)
     right.mkdir(parents=True, exist_ok=True)
     return left, right
+
+
+def ensure_single_image_dir(root: Path | str) -> Path:
+    single = Path(root) / "single"
+    single.mkdir(parents=True, exist_ok=True)
+    return single
 
 
 def list_image_pairs(root: Path | str) -> list[ImagePair]:
@@ -38,9 +50,26 @@ def list_image_pairs(root: Path | str) -> list[ImagePair]:
     return pairs
 
 
+def list_single_images(root: Path | str) -> list[SingleImage]:
+    single_dir = ensure_single_image_dir(root)
+    images: list[SingleImage] = []
+    for path in sorted(single_dir.glob("*.png")):
+        try:
+            index = int(path.stem)
+        except ValueError:
+            index = len(images) + 1
+        images.append(SingleImage(index=index, path=path))
+    return images
+
+
 def next_pair_index(root: Path | str) -> int:
     pairs = list_image_pairs(root)
     return max((pair.index for pair in pairs), default=0) + 1
+
+
+def next_single_image_index(root: Path | str) -> int:
+    images = list_single_images(root)
+    return max((image.index for image in images), default=0) + 1
 
 
 def save_image_pair(root: Path | str, left_frame: np.ndarray, right_frame: np.ndarray) -> ImagePair:
@@ -56,6 +85,15 @@ def save_image_pair(root: Path | str, left_frame: np.ndarray, right_frame: np.nd
     return ImagePair(index=index, left_path=left_path, right_path=right_path)
 
 
+def save_single_image(root: Path | str, frame: np.ndarray) -> SingleImage:
+    single_dir = ensure_single_image_dir(root)
+    index = next_single_image_index(root)
+    path = single_dir / f"{index:04d}.png"
+    if not cv2.imwrite(str(path), frame):
+        raise RuntimeError(f"Failed to save {path}")
+    return SingleImage(index=index, path=path)
+
+
 def delete_last_image_pair(root: Path | str) -> ImagePair | None:
     pairs = list_image_pairs(root)
     if not pairs:
@@ -67,20 +105,41 @@ def delete_last_image_pair(root: Path | str) -> ImagePair | None:
     return pair
 
 
+def delete_last_single_image(root: Path | str) -> SingleImage | None:
+    images = list_single_images(root)
+    if not images:
+        return None
+    image = max(images, key=lambda item: item.index)
+    image.path.unlink(missing_ok=True)
+    return image
+
+
 def ensure_output_dir(root: Path | str) -> Path:
     output_dir = Path(root)
     output_dir.mkdir(parents=True, exist_ok=True)
     return output_dir
 
 
-def save_calibration_npz(output_dir: Path | str, data: dict[str, np.ndarray | float | tuple[int, int]]) -> Path:
-    path = ensure_output_dir(output_dir) / "stereo_calib.npz"
+def _calibration_path(output_dir: Path | str, stem: str, suffix: str) -> Path:
+    return ensure_output_dir(output_dir) / f"{stem}.{suffix}"
+
+
+def save_calibration_npz(
+    output_dir: Path | str,
+    data: dict[str, np.ndarray | float | str | tuple[int, int]],
+    stem: str = "stereo_calib",
+) -> Path:
+    path = _calibration_path(output_dir, stem, "npz")
     np.savez(path, **data)
     return path
 
 
-def save_calibration_yaml(output_dir: Path | str, data: dict[str, np.ndarray | float | tuple[int, int]]) -> Path:
-    path = ensure_output_dir(output_dir) / "stereo_calib.yaml"
+def save_calibration_yaml(
+    output_dir: Path | str,
+    data: dict[str, np.ndarray | float | str | tuple[int, int]],
+    stem: str = "stereo_calib",
+) -> Path:
+    path = _calibration_path(output_dir, stem, "yaml")
     serializable = {}
     for key, value in data.items():
         if isinstance(value, np.ndarray):
@@ -96,6 +155,14 @@ def save_calibration_yaml(output_dir: Path | str, data: dict[str, np.ndarray | f
 
 def load_calibration_npz(output_dir: Path | str) -> dict[str, np.ndarray]:
     path = Path(output_dir) / "stereo_calib.npz"
+    if not path.exists():
+        raise FileNotFoundError(path)
+    with np.load(path) as data:
+        return {key: data[key] for key in data.files}
+
+
+def load_mono_calibration_npz(output_dir: Path | str) -> dict[str, np.ndarray]:
+    path = Path(output_dir) / "mono_calib.npz"
     if not path.exists():
         raise FileNotFoundError(path)
     with np.load(path) as data:

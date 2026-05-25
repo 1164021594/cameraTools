@@ -9,7 +9,13 @@ import numpy as np
 
 from stereo_aruco_gui.app.aruco_board import DetectionResult, board_object_map, common_board_points, detect_markers
 from stereo_aruco_gui.app.config import ArucoConfig
-from stereo_aruco_gui.app.storage import ImagePair, list_image_pairs, save_calibration_npz, save_calibration_yaml
+from stereo_aruco_gui.app.storage import (
+    ImagePair,
+    list_image_pairs,
+    list_single_images,
+    save_calibration_npz,
+    save_calibration_yaml,
+)
 
 
 MIN_DETECTED_POINTS_PER_PAIR = 16
@@ -57,6 +63,25 @@ class StereoCalibrationResult:
             "P1": self.P1,
             "P2": self.P2,
             "Q": self.Q,
+        }
+
+
+@dataclass(frozen=True)
+class MonoCalibrationResult:
+    error: float
+    image_size: tuple[int, int]
+    K: np.ndarray
+    D: np.ndarray
+    valid_images: int
+
+    def as_dict(self) -> dict[str, np.ndarray | float | int | str | tuple[int, int]]:
+        return {
+            "calibration_type": "mono",
+            "error": float(self.error),
+            "image_size": self.image_size,
+            "K": self.K,
+            "D": self.D,
+            "valid_images": int(self.valid_images),
         }
 
 
@@ -254,6 +279,73 @@ def collect_calibration_points(
         raise RuntimeError("No readable image pairs found")
 
     return all_obj_points, all_left_points, all_right_points, image_size, len(all_obj_points)
+
+
+def collect_mono_calibration_points(
+    image_root: Path | str,
+    aruco_config: ArucoConfig,
+    min_points_per_image: int = MIN_CALIBRATION_POINTS_PER_PAIR,
+) -> tuple[list[np.ndarray], list[np.ndarray], tuple[int, int], int]:
+    board = board_object_map(aruco_config)
+    all_obj_points: list[np.ndarray] = []
+    all_image_points: list[np.ndarray] = []
+    image_size: tuple[int, int] | None = None
+
+    for image in list_single_images(image_root):
+        frame = cv2.imread(str(image.path))
+        if frame is None:
+            continue
+        if image_size is None:
+            image_size = (frame.shape[1], frame.shape[0])
+        if (frame.shape[1], frame.shape[0]) != image_size:
+            continue
+
+        detection = detect_markers(frame, aruco_config)
+        if detection.ids is None:
+            continue
+        obj_points: list[np.ndarray] = []
+        image_points: list[np.ndarray] = []
+        for marker_index, marker_id in enumerate(detection.ids.flatten()):
+            marker_id = int(marker_id)
+            if marker_id not in board:
+                continue
+            obj_points.extend(np.asarray(board[marker_id], dtype=np.float32))
+            image_points.extend(np.asarray(detection.corners[marker_index][0], dtype=np.float32))
+        if len(obj_points) >= min_points_per_image:
+            all_obj_points.append(np.asarray(obj_points, dtype=np.float32))
+            all_image_points.append(np.asarray(image_points, dtype=np.float32))
+
+    if image_size is None:
+        raise RuntimeError("No readable single camera images found")
+
+    return all_obj_points, all_image_points, image_size, len(all_obj_points)
+
+
+def calibrate_mono_from_images(
+    image_root: Path | str,
+    output_dir: Path | str,
+    aruco_config: ArucoConfig,
+    min_valid_images: int = 15,
+) -> MonoCalibrationResult:
+    images = list_single_images(image_root)
+    if len(images) < min_valid_images:
+        raise RuntimeError(f"Need at least {min_valid_images} single camera images, found {len(images)}")
+
+    obj_points, image_points, image_size, valid_images = collect_mono_calibration_points(image_root, aruco_config)
+    if valid_images < min_valid_images:
+        raise RuntimeError(f"Need at least {min_valid_images} valid single camera images, found {valid_images}")
+
+    error, K, D, _, _ = cv2.calibrateCamera(obj_points, image_points, image_size, None, None)
+    result = MonoCalibrationResult(
+        error=float(error),
+        image_size=image_size,
+        K=K,
+        D=D,
+        valid_images=valid_images,
+    )
+    save_calibration_npz(output_dir, result.as_dict(), stem="mono_calib")
+    save_calibration_yaml(output_dir, result.as_dict(), stem="mono_calib")
+    return result
 
 
 def calibrate_from_pairs(
