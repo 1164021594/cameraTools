@@ -7,6 +7,15 @@ from decoder_debugger.image_io import list_image_files, read_image_color
 from decoder_debugger.overlay import draw_debug_overlay
 from industrial_code_reader.core.types import CodeResult, Roi
 
+import os
+
+from PySide6.QtWidgets import QApplication
+
+import decoder_debugger.main_window as debugger_window_module
+from decoder_debugger.main_window import DecoderDebuggerWindow
+
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
 
 def test_read_image_color_uses_unicode_safe_decode_before_imread(monkeypatch, tmp_path):
     image_path = tmp_path / "unicode-image.bmp"
@@ -59,3 +68,35 @@ def test_draw_debug_overlay_marks_rois_results_and_failures():
     assert np.any(overlay != image)
     assert np.array_equal(overlay[12, 10], np.array([0, 255, 0], dtype=np.uint8))
     assert np.array_equal(overlay[20, 50], np.array([0, 0, 255], dtype=np.uint8))
+
+
+def test_decoder_debugger_window_loads_image_and_runs_decode(monkeypatch, tmp_path):
+    app = QApplication.instance() or QApplication([])
+    image_path = tmp_path / "sample.bmp"
+    image_path.write_bytes(b"fake")
+    frame = np.zeros((40, 50, 3), dtype=np.uint8)
+    rois = (Roi(id=1, x=5, y=6, width=20, height=20),)
+    results = [CodeResult(text="ABC123", symbology="DataMatrix", roi_id=1, bbox=(5, 6, 20, 20), preprocessing="fake")]
+
+    monkeypatch.setattr(debugger_window_module, "read_image_color", lambda path: frame.copy())
+    monkeypatch.setattr(debugger_window_module.DataMatrixRoiGenerator, "generate", lambda self, image: rois)
+
+    class FakeEngine:
+        def __init__(self, decoders):  # noqa: ANN001
+            pass
+
+        def decode(self, image, options):  # noqa: ANN001
+            return results
+
+    monkeypatch.setattr(debugger_window_module, "CodeReaderEngine", FakeEngine)
+
+    window = DecoderDebuggerWindow()
+    window.load_image_path(image_path)
+    window.run_decode()
+
+    assert app is not None
+    assert window.current_path == image_path
+    assert window.image_view._last_frame is not None
+    assert "ABC123" in window.result_box.toPlainText()
+    assert "ROI 1" in window.result_box.toPlainText()
+    assert "Total" in window.timing_label.text()
