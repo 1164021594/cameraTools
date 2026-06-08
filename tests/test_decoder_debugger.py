@@ -12,6 +12,7 @@ import os
 from PySide6.QtWidgets import QApplication
 
 import decoder_debugger.main_window as debugger_window_module
+import decoder_debugger.main as debugger_main_module
 from decoder_debugger.main_window import DecoderDebuggerWindow
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -100,3 +101,24 @@ def test_decoder_debugger_window_loads_image_and_runs_decode(monkeypatch, tmp_pa
     assert "ABC123" in window.result_box.toPlainText()
     assert "ROI 1" in window.result_box.toPlainText()
     assert "Total" in window.timing_label.text()
+
+
+def test_main_creates_decoder_debugger_window(monkeypatch):
+    created = {}
+
+    class FakeApp:
+        def __init__(self, argv):  # noqa: ANN001
+            created["argv"] = argv
+
+        def exec(self):  # noqa: A003
+            return 0
+
+    class FakeWindow:
+        def show(self):
+            created["shown"] = True
+
+    monkeypatch.setattr(debugger_main_module, "QApplication", FakeApp)
+    monkeypatch.setattr(debugger_main_module, "DecoderDebuggerWindow", lambda: FakeWindow())
+
+    assert debugger_main_module.main(["decoder"]) == 0
+    assert created == {"argv": ["decoder"], "shown": True}

@@ -16,6 +16,14 @@ python -m pip install -r requirements.txt
 python -m stereo_aruco_gui.main
 ```
 
+## Decoder Debugger
+
+Run the standalone DataMatrix decoder debugger without opening cameras:
+
+```powershell
+python -m decoder_debugger.main
+```
+
 ## Basic Workflow
 
 1. Click `Scan Cameras` to enumerate readable USB camera indexes.
