@@ -24,6 +24,7 @@ class DecodeOptions:
     rois: tuple[Roi, ...] = ()
     auto_rois: bool = False
     max_results: int = 16
+    max_rois: int = 16
     enable_preprocessing: bool = True
     return_failures: bool = False
 

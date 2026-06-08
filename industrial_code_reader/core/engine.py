@@ -15,16 +15,18 @@ class CodeReaderEngine:
         if decode_options.rois:
             return self._decode_rois(image, decode_options)
         if decode_options.auto_rois and _wants_datamatrix(decode_options):
-            auto_rois = _generate_datamatrix_rois(image)
-            if auto_rois:
-                auto_options = DecodeOptions(
-                    symbologies=decode_options.symbologies,
-                    rois=auto_rois,
-                    max_results=decode_options.max_results,
-                    enable_preprocessing=decode_options.enable_preprocessing,
-                    return_failures=decode_options.return_failures,
-                )
-                return self._decode_rois(image, auto_options)
+            auto_rois = _generate_datamatrix_rois(image)[: decode_options.max_rois]
+            if not auto_rois:
+                return []
+            auto_options = DecodeOptions(
+                symbologies=decode_options.symbologies,
+                rois=auto_rois,
+                max_results=decode_options.max_results,
+                max_rois=decode_options.max_rois,
+                enable_preprocessing=decode_options.enable_preprocessing,
+                return_failures=decode_options.return_failures,
+            )
+            return self._decode_rois(image, auto_options)
         return self._decode_image(image, decode_options)
 
     def _decode_image(self, image: np.ndarray, decode_options: DecodeOptions) -> list[CodeResult]:
@@ -49,6 +51,7 @@ class CodeReaderEngine:
                 symbologies=decode_options.symbologies,
                 roi_id=clipped.id,
                 max_results=decode_options.max_results,
+                max_rois=decode_options.max_rois,
                 enable_preprocessing=decode_options.enable_preprocessing,
                 return_failures=decode_options.return_failures,
             )
@@ -57,7 +60,7 @@ class CodeReaderEngine:
                 roi_results = [_failure_result(clipped)]
             for result in roi_results:
                 results.append(_offset_result(result, clipped.x, clipped.y))
-                if len(results) >= decode_options.max_results:
+                if result.text and len([item for item in results if item.text]) >= decode_options.max_results:
                     return results[: decode_options.max_results]
         return results
 

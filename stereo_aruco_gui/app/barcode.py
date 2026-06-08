@@ -105,7 +105,10 @@ def decode_barcodes(frame: np.ndarray, enabled_labels: list[str] | tuple[str, ..
 def _decode_industrial_datamatrix(frame: np.ndarray) -> list[BarcodeDetection]:
     return [
         _detection_from_code_result(result)
-        for result in _datamatrix_engine().decode(frame, DecodeOptions(symbologies=("DataMatrix",), auto_rois=True, return_failures=True))
+        for result in _datamatrix_engine().decode(
+            frame,
+            DecodeOptions(symbologies=("DataMatrix",), auto_rois=True, max_results=16, max_rois=16, return_failures=True),
+        )
     ]
 
 

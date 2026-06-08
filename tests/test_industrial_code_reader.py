@@ -154,6 +154,46 @@ def test_datamatrix_roi_generator_prioritizes_internal_module_texture_over_blank
     assert best.quality["module_texture"] > 0.10
 
 
+def test_datamatrix_roi_generator_finds_colored_pcb_code_connected_to_large_board_edge():
+    cv2 = __import__("cv2")
+    image = np.full((180, 260, 3), 255, dtype=np.uint8)
+    cv2.rectangle(image, (20, 20), (230, 150), (0, 120, 90), -1)
+    cv2.rectangle(image, (18, 18), (232, 152), (0, 255, 160), 6)
+
+    x0, y0, cell = 150, 80, 5
+    for row in range(14):
+        for col in range(14):
+            color = (230, 230, 230) if row == 0 or col == 0 or (row + col) % 2 == 0 else (0, 110, 70)
+            image[y0 + row * cell : y0 + (row + 1) * cell, x0 + col * cell : x0 + (col + 1) * cell] = color
+
+    rois = DataMatrixRoiGenerator(min_area=80, padding=6).generate(image)
+
+    assert rois
+    best = rois[0]
+    assert best.x <= x0
+    assert best.y <= y0
+    assert best.x + best.width >= x0 + 14 * cell
+    assert best.y + best.height >= y0 + 14 * cell
+    assert best.quality["source"] == "mser_saturation"
+
+
+def test_engine_skips_expensive_full_image_fallback_when_auto_rois_find_nothing(monkeypatch):
+    class FailIfCalledDecoder:
+        symbology = "DataMatrix"
+
+        def decode(self, image, options):  # noqa: ANN001
+            raise AssertionError("full image decode should not run when auto ROI detection finds nothing")
+
+    monkeypatch.setattr("industrial_code_reader.core.engine._generate_datamatrix_rois", lambda image: ())
+
+    image = np.full((3000, 4000, 3), 255, dtype=np.uint8)
+    engine = CodeReaderEngine(decoders=[FailIfCalledDecoder()])
+
+    results = engine.decode(image, DecodeOptions(auto_rois=True, return_failures=True))
+
+    assert results == []
+
+
 def test_engine_can_decode_auto_generated_datamatrix_rois():
     class FakeDecoder:
         symbology = "DataMatrix"
