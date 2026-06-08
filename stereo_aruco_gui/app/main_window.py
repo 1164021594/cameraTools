@@ -11,6 +11,7 @@ from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
     QDoubleSpinBox,
+    QFileDialog,
     QFormLayout,
     QGridLayout,
     QGroupBox,
@@ -28,9 +29,11 @@ from PySide6.QtWidgets import (
 
 from stereo_aruco_gui.app.aruco_board import ARUCO_DICTIONARIES, detect_markers, draw_detection
 from stereo_aruco_gui.app.barcode import (
+    BARCODE_DECODER_OPTIONS,
     SUPPORTED_BARCODE_LABELS,
     BarcodeConfirmation,
     BarcodeDetection,
+    barcode_roi_summary,
     decode_barcodes,
     draw_barcode_detections,
 )
@@ -78,9 +81,11 @@ RESOLUTION_OPTIONS = (
     (1024, 768),
     (1280, 960),
     (1920, 1080),
+    (2560, 1440),
     (2592, 1944),
 )
 DEFAULT_RESOLUTION = (1280, 960)
+CUSTOM_RESOLUTION_LABEL = "Custom"
 
 VIEW_MODES = (
     "Live Preview",
@@ -121,6 +126,19 @@ def parse_resolution_label(label: str) -> tuple[int, int]:
     return int(width_text.strip()), int(height_text.strip())
 
 
+def read_image_color(path: str | Path) -> np.ndarray | None:
+    try:
+        data = np.fromfile(path, dtype=np.uint8)
+    except OSError:
+        return cv2.imread(str(path), cv2.IMREAD_COLOR)
+    if data.size == 0:
+        return None
+    image = cv2.imdecode(data, cv2.IMREAD_COLOR)
+    if image is not None:
+        return image
+    return cv2.imread(str(path), cv2.IMREAD_COLOR)
+
+
 class MainWindow(QMainWindow):
     def __init__(self, config: AppConfig) -> None:
         super().__init__()
@@ -138,6 +156,7 @@ class MainWindow(QMainWindow):
         self.barcode_confirmation = BarcodeConfirmation(required_count=3)
         self.latest_barcode_detections: list[BarcodeDetection] = []
         self._last_confirmed_barcode_key: tuple[str, str] | None = None
+        self._last_barcode_roi_log_key: tuple[tuple[str, str, object], ...] | None = None
         self.latest_disparity: np.ndarray | None = None
         self._opening_labels: set[str] = set()
         self._original_dialogs: list[OriginalImageDialog] = []
@@ -235,12 +254,15 @@ class MainWindow(QMainWindow):
         self.right_view.image_clicked.connect(self._handle_image_click)
         left_title = QLabel("Left Camera")
         right_title = QLabel("Right Camera")
+        self.left_title = left_title
+        self.right_title = right_title
         left_title.setMaximumHeight(20)
         right_title.setMaximumHeight(20)
         preview_layout.addWidget(left_title, 0, 0)
         preview_layout.addWidget(right_title, 0, 1)
         preview_layout.addWidget(self.left_view, 1, 0)
         preview_layout.addWidget(self.right_view, 1, 1)
+        self.preview_grid = preview_layout
         preview_panel_layout.addLayout(preview_layout, stretch=1)
         layout.addWidget(preview_panel, 0, 1)
 
@@ -284,6 +306,9 @@ class MainWindow(QMainWindow):
         self.left_index.currentIndexChanged.connect(self._refresh_diagnostics)
         self.right_index.currentIndexChanged.connect(self._refresh_diagnostics)
         self.resolution = self._resolution_combo(cam.width, cam.height)
+        self.resolution.currentTextChanged.connect(self._resolution_changed)
+        self.custom_width = self._spin(1, 10000, cam.width)
+        self.custom_height = self._spin(1, 10000, cam.height)
         self.fps = self._spin(1, 120, cam.fps)
         self.backend = QComboBox()
         self.backend.addItems(list(BACKEND_OPTIONS))
@@ -306,6 +331,10 @@ class MainWindow(QMainWindow):
         form.addRow("Left camera", self.left_index)
         form.addRow("Right camera", self.right_index)
         form.addRow("Resolution", self.resolution)
+        self.custom_width_label = QLabel("Custom width")
+        self.custom_height_label = QLabel("Custom height")
+        form.addRow(self.custom_width_label, self.custom_width)
+        form.addRow(self.custom_height_label, self.custom_height)
         form.addRow("FPS", self.fps)
         form.addRow("Backend", self.backend)
         form.addRow("Format", self.pixel_format)
@@ -313,6 +342,7 @@ class MainWindow(QMainWindow):
         form.addRow("Stats", self.camera_stats)
         form.addRow(self.scan_button, self.open_button)
         form.addRow(self.swap_button, save_btn)
+        self._resolution_changed(self.resolution.currentText())
         return group
 
     def _capture_group(self) -> QGroupBox:
@@ -415,17 +445,22 @@ class MainWindow(QMainWindow):
     def _barcode_group(self) -> QGroupBox:
         group = QGroupBox("3. Barcode Detection")
         form = QFormLayout(group)
+        self.barcode_decoder = QComboBox()
+        self.barcode_decoder.addItems(list(BARCODE_DECODER_OPTIONS))
         self.barcode_format = QComboBox()
         self.barcode_format.addItems(("All", *SUPPORTED_BARCODE_LABELS))
         self.barcode_format.setCurrentText("All")
         self.barcode_confirm_frames = self._spin(1, 20, 3)
         self.barcode_info = QLabel("Select barcode type and show a barcode in the left/current camera view.")
         self.barcode_info.setWordWrap(True)
+        self.load_barcode_image_button = QPushButton("Load Image")
+        self.load_barcode_image_button.clicked.connect(self._load_barcode_debug_image)
         self.clear_barcode_button = QPushButton("Clear Barcode Result")
         self.clear_barcode_button.clicked.connect(self._clear_barcode_result)
+        form.addRow("Decoder", self.barcode_decoder)
         form.addRow("Type", self.barcode_format)
         form.addRow("Confirm frames", self.barcode_confirm_frames)
-        form.addRow("", self.clear_barcode_button)
+        form.addRow(self.load_barcode_image_button, self.clear_barcode_button)
         form.addRow("Result", self.barcode_info)
         return group
 
@@ -488,6 +523,7 @@ class MainWindow(QMainWindow):
             combo.addItem(resolution_label(option_width, option_height))
         selected = current if current in options else DEFAULT_RESOLUTION
         combo.setCurrentText(resolution_label(*selected))
+        combo.addItem(CUSTOM_RESOLUTION_LABEL)
         return combo
 
     def _double_spin(self, minimum: float, maximum: float, value: float) -> QDoubleSpinBox:
@@ -499,7 +535,10 @@ class MainWindow(QMainWindow):
         return spin
 
     def _current_camera_config(self) -> CameraConfig:
-        width, height = parse_resolution_label(self.resolution.currentText())
+        if self.resolution.currentText() == CUSTOM_RESOLUTION_LABEL:
+            width, height = self.custom_width.value(), self.custom_height.value()
+        else:
+            width, height = parse_resolution_label(self.resolution.currentText())
         return CameraConfig(
             left_index=self._selected_camera_index(self.left_index),
             right_index=self._selected_camera_index(self.right_index),
@@ -510,6 +549,13 @@ class MainWindow(QMainWindow):
             backend=self.backend.currentText(),
             pixel_format=self.pixel_format.currentText(),
         )
+
+    def _resolution_changed(self, label: str) -> None:
+        is_custom = label == CUSTOM_RESOLUTION_LABEL
+        self.custom_width_label.setVisible(is_custom)
+        self.custom_height_label.setVisible(is_custom)
+        self.custom_width.setVisible(is_custom)
+        self.custom_height.setVisible(is_custom)
 
     def _current_disparity_config(self) -> DisparityConfig:
         return DisparityConfig(
@@ -706,7 +752,7 @@ class MainWindow(QMainWindow):
                 show_left = self._draw_2d_measurement_overlay(show_left)
             elif mode == "Barcode Detection":
                 show_left = self._process_barcode_frame(show_left)
-            left_preview = preview_copy(show_left)
+            left_preview = show_left.copy() if mode == "Barcode Detection" else preview_copy(show_left)
             self.left_view.set_frame(left_preview)
             self.left_view.set_source_size(show_left.shape[1], show_left.shape[0])
             self.right_view.setText("Single camera mode")
@@ -756,6 +802,11 @@ class MainWindow(QMainWindow):
         elif mode == "Barcode Detection":
             show_left = self._process_barcode_frame(show_left)
             self.latest_disparity = None
+            left_preview = show_left.copy()
+            self.left_view.set_frame(left_preview)
+            self.left_view.set_source_size(show_left.shape[1], show_left.shape[0])
+            self.preview_info.setText("Frozen Preview" if freeze_preview else mode)
+            return
         else:
             self.latest_disparity = None
         left_preview = preview_copy(show_left)
@@ -1162,25 +1213,38 @@ class MainWindow(QMainWindow):
 
     def _process_barcode_frame(self, image: np.ndarray) -> np.ndarray:
         try:
-            detections = decode_barcodes(image, self._enabled_barcode_labels())
+            detections = decode_barcodes(image, self._enabled_barcode_labels(), decoder_name=self.barcode_decoder.currentText())
         except Exception as exc:  # noqa: BLE001
             self.latest_barcode_detections = []
             self.barcode_info.setText(str(exc))
             self._set_diagnostic(str(exc))
             return image
         self.latest_barcode_detections = detections
+        self._log_barcode_detections(detections)
         self.barcode_confirmation.required_count = max(1, self.barcode_confirm_frames.value())
-        confirmed = self.barcode_confirmation.update(detections)
+        successful_detections = [detection for detection in detections if detection.text and detection.failure_reason is None]
+        confirmed = self.barcode_confirmation.update(successful_detections)
         if confirmed is None:
-            self.barcode_info.setText(self.barcode_confirmation.status_text())
+            self.barcode_info.setText(self._barcode_info_text(successful_detections) if successful_detections else self.barcode_confirmation.status_text())
         else:
             key = (confirmed.text, confirmed.format)
-            self.barcode_info.setText(f"{confirmed.text} ({confirmed.format})")
+            self.barcode_info.setText(self._barcode_info_text(successful_detections) if successful_detections else f"{confirmed.text} ({confirmed.format})")
             self.distance_state.setText(f"Barcode: {confirmed.text}")
             if key != self._last_confirmed_barcode_key:
                 self._log(f"Barcode confirmed: {confirmed.text} ({confirmed.format})")
                 self._last_confirmed_barcode_key = key
         return draw_barcode_detections(image, detections)
+
+    def _barcode_info_text(self, detections: list[BarcodeDetection]) -> str:
+        return "\n".join(f"ROI {index}: {detection.text} ({detection.format})" for index, detection in enumerate(detections, start=1))
+
+    def _log_barcode_detections(self, detections: list[BarcodeDetection]) -> None:
+        key = tuple((detection.text, detection.format, detection.points) for detection in detections)
+        if key == getattr(self, "_last_barcode_roi_log_key", None):
+            return
+        self._last_barcode_roi_log_key = key
+        for index, detection in enumerate(detections, start=1):
+            self._log(barcode_roi_summary(index, detection))
 
     def _enabled_barcode_labels(self) -> list[str]:
         current = self.barcode_format.currentText()
@@ -1274,9 +1338,39 @@ class MainWindow(QMainWindow):
         self.barcode_confirmation.reset()
         self.latest_barcode_detections = []
         self._last_confirmed_barcode_key = None
+        self._last_barcode_roi_log_key = None
         self.distance_state.setText("Barcode: --")
         self.barcode_info.setText("No barcode")
         self._log("Cleared barcode result")
+
+    def _load_barcode_debug_image(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Load Barcode Image",
+            "",
+            "Images (*.png *.jpg *.jpeg *.bmp *.tif *.tiff);;All Files (*)",
+        )
+        if not path:
+            return
+        image = read_image_color(path)
+        if image is None:
+            self._error(f"Failed to read image: {path}")
+            return
+        self.latest_left = image
+        self.latest_right = None
+        self.barcode_confirmation.required_count = 1
+        self.barcode_confirm_frames.setValue(1)
+        show_left = self._process_barcode_frame(image)
+        self.left_view.set_frame(show_left.copy())
+        self.left_view.set_source_size(show_left.shape[1], show_left.shape[0])
+        self.right_view.setText("Image debug")
+        self.view_mode.setCurrentText("Barcode Detection")
+        self.preview_info.setText("Barcode Image Debug")
+        if self.latest_barcode_detections:
+            results = ", ".join(f"{detection.text} ({detection.format})" for detection in self.latest_barcode_detections)
+            self._log(f"Barcode image decoded: {results} from {path}")
+        else:
+            self._log(f"Barcode image decoded: no barcode from {path}")
 
     def _save_current_config(self) -> None:
         self.config.camera = self._current_camera_config()
@@ -1340,7 +1434,15 @@ class MainWindow(QMainWindow):
         self.depth_group.setVisible(depth_mode)
         self.measurement_2d_group.setVisible(measurement_mode)
         self.barcode_group.setVisible(barcode_mode)
+        self._set_barcode_preview_layout(barcode_mode)
         self.preview_info.setText(mode)
+
+    def _set_barcode_preview_layout(self, barcode_mode: bool) -> None:
+        self.right_title.setVisible(not barcode_mode)
+        self.right_view.setVisible(not barcode_mode)
+        self.left_view.set_zoom_enabled(barcode_mode)
+        self.right_view.set_zoom_enabled(False)
+        self.preview_grid.addWidget(self.left_view, 1, 0, 1, 2 if barcode_mode else 1)
 
     def _refresh_diagnostics(self) -> None:
         try:

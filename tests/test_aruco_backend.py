@@ -3,8 +3,10 @@ from __future__ import annotations
 import os
 
 import numpy as np
+from PySide6.QtCore import QPoint
 from PySide6.QtWidgets import QApplication
 
+from industrial_code_reader.core.types import CodeResult
 import stereo_aruco_gui.app.barcode as barcode_module
 import stereo_aruco_gui.app.camera_worker as camera_worker_module
 import stereo_aruco_gui.app.main_window as main_window_module
@@ -14,6 +16,7 @@ from stereo_aruco_gui.app.aruco_board import board_object_map, create_board, cre
 from stereo_aruco_gui.app.barcode import (
     BarcodeConfirmation,
     BarcodeDetection,
+    SUPPORTED_BARCODE_LABELS,
     barcode_formats_for_labels,
     decode_barcodes,
     draw_barcode_detections,
@@ -45,7 +48,7 @@ from stereo_aruco_gui.app.config import CameraConfig
 from stereo_aruco_gui.app.config import AppConfig
 from stereo_aruco_gui.app.config import ArucoConfig, load_config
 from stereo_aruco_gui.app.image_view import ImageView
-from stereo_aruco_gui.app.main_window import MainWindow, parse_resolution_label
+from stereo_aruco_gui.app.main_window import MainWindow, parse_resolution_label, read_image_color
 from stereo_aruco_gui.app.measurement_2d import plane_distance_between_pixels
 from stereo_aruco_gui.app.rectification import DisparityConfig, compute_disparity, distance_at, filtered_disparity_preview
 from stereo_aruco_gui.app.storage import (
@@ -167,6 +170,30 @@ def test_parse_resolution_label_returns_width_and_height():
     assert parse_resolution_label("1280 x 960") == (1280, 960)
 
 
+def test_read_image_color_uses_unicode_safe_file_decode_before_imread(monkeypatch, tmp_path):
+    image_path = tmp_path / "二维码.bmp"
+    image_path.write_bytes(b"encoded image bytes")
+    decoded_image = np.zeros((10, 12, 3), dtype=np.uint8)
+    calls = {"imread": 0, "imdecode": 0}
+
+    def fake_imread(path, flags):  # noqa: ANN001
+        calls["imread"] += 1
+        return None
+
+    def fake_imdecode(data, flags):  # noqa: ANN001
+        calls["imdecode"] += 1
+        assert data.tobytes() == b"encoded image bytes"
+        return decoded_image
+
+    monkeypatch.setattr(main_window_module.cv2, "imread", fake_imread)
+    monkeypatch.setattr(main_window_module.cv2, "imdecode", fake_imdecode)
+
+    image = read_image_color(image_path)
+
+    assert image is decoded_image
+    assert calls == {"imread": 0, "imdecode": 1}
+
+
 def test_resolution_dropdown_uses_4_3_modes_for_this_camera_module():
     app = QApplication.instance() or QApplication([])
     window = MainWindow(load_config())
@@ -175,7 +202,23 @@ def test_resolution_dropdown_uses_4_3_modes_for_this_camera_module():
 
     assert app is not None
     assert "1280 x 960" in options
+    assert "2560 x 1440" in options
     assert "1280 x 720" not in options
+
+
+def test_resolution_dropdown_custom_option_uses_manual_width_and_height():
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow(load_config())
+
+    window.resolution.setCurrentText("Custom")
+    window.custom_width.setValue(2560)
+    window.custom_height.setValue(1440)
+
+    camera = window._current_camera_config()
+
+    assert app is not None
+    assert camera.width == 2560
+    assert camera.height == 1440
 
 
 def test_resolution_dropdown_replaces_legacy_16_9_config_with_4_3_default():
@@ -250,6 +293,99 @@ def test_decode_barcodes_reads_generated_qrcode():
     assert detections[0].points is not None
 
 
+def test_decode_barcodes_uses_industrial_datamatrix_engine(monkeypatch):
+    class FakeEngine:
+        def decode(self, frame, options):  # noqa: ANN001
+            assert options.symbologies == ("DataMatrix",)
+            assert options.auto_rois is True
+            assert options.return_failures is True
+            return [CodeResult(text="DM-777", symbology="DataMatrix", roi_id=1, points=((1, 1), (4, 1), (4, 4), (1, 4)))]
+
+    monkeypatch.setattr(barcode_module, "_datamatrix_engine", lambda: FakeEngine())
+
+    detections = decode_barcodes(np.zeros((12, 12, 3), dtype=np.uint8), enabled_labels=["DataMatrix"])
+
+    assert detections[0].text == "DM-777"
+    assert detections[0].format == "DataMatrix"
+    assert detections[0].points == ((1, 1), (4, 1), (4, 4), (1, 4))
+    assert detections[0].roi_id == 1
+
+
+def test_decode_barcodes_zxing_decoder_skips_industrial_engine(monkeypatch):
+    called = {"industrial": False, "zxing": False}
+
+    class FakeZxing:
+        @staticmethod
+        def read_barcodes(frame, formats=None):  # noqa: ANN001
+            called["zxing"] = True
+            return []
+
+    monkeypatch.setattr(barcode_module, "_datamatrix_engine", lambda: called.__setitem__("industrial", True))
+    monkeypatch.setattr(barcode_module, "require_zxingcpp", lambda: FakeZxing)
+    monkeypatch.setattr(barcode_module, "barcode_formats_for_labels", lambda labels: None)
+
+    detections = decode_barcodes(np.zeros((12, 12, 3), dtype=np.uint8), enabled_labels=["DataMatrix"], decoder_name="ZXing")
+
+    assert detections == []
+    assert called["zxing"] is True
+    assert called["industrial"] is False
+
+
+def test_decode_barcodes_halcon_decoder_reports_unavailable():
+    detections = decode_barcodes(np.zeros((12, 12, 3), dtype=np.uint8), enabled_labels=["DataMatrix"], decoder_name="HALCON")
+
+    assert detections[0].failure_reason == "HALCON decoder is not configured"
+    assert detections[0].format == "HALCON"
+
+
+def test_barcode_detection_logs_industrial_reader_failure_diagnostics(monkeypatch):
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow(load_config())
+    window.view_mode.setCurrentText("Barcode Detection")
+    window.barcode_format.setCurrentText("DataMatrix")
+
+    diagnostic = BarcodeDetection(
+        text="",
+        format="DataMatrix",
+        points=None,
+        roi_id=3,
+        bbox=(10, 20, 30, 40),
+        preprocessing="none",
+        failure_reason="No DataMatrix decoded in ROI",
+        quality={"roi": {"edge_density": 0.12, "area": 900, "aspect": 1.1}},
+    )
+    monkeypatch.setattr(main_window_module, "decode_barcodes", lambda frame, enabled_labels, decoder_name="Auto": [diagnostic])
+
+    window._update_frames(np.zeros((80, 100, 3), dtype=np.uint8), None)
+    log_text = window.status_box.toPlainText()
+
+    assert app is not None
+    assert "ROI 3 | DataMatrix | decode failed: No DataMatrix decoded in ROI" in log_text
+    assert "bbox x=10, y=20, w=30, h=40" in log_text
+    assert "edge_density=0.120" in log_text
+    assert "area=900" in log_text
+    assert "aspect=1.100" in log_text
+
+
+def test_barcode_detection_passes_selected_decoder_to_decode(monkeypatch):
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow(load_config())
+    window.view_mode.setCurrentText("Barcode Detection")
+    window.barcode_decoder.setCurrentText("ZXing")
+    calls = {}
+
+    def fake_decode(frame, enabled_labels, decoder_name="Auto"):  # noqa: ANN001
+        calls["decoder_name"] = decoder_name
+        return []
+
+    monkeypatch.setattr(main_window_module, "decode_barcodes", fake_decode)
+
+    window._update_frames(np.zeros((20, 20, 3), dtype=np.uint8), None)
+
+    assert app is not None
+    assert calls["decoder_name"] == "ZXing"
+
+
 def test_barcode_confirmation_requires_repeated_same_result():
     confirmation = BarcodeConfirmation(required_count=3)
     detection = BarcodeDetection(text="ABC123", format="Code 128", points=None)
@@ -299,7 +435,7 @@ def test_barcode_detection_updates_preview_and_confirmed_result(monkeypatch):
     window.barcode_confirm_frames.setValue(1)
     detection = BarcodeDetection(text="ABC123", format="Code 128", points=((2, 2), (8, 2), (8, 8), (2, 8)))
 
-    monkeypatch.setattr(main_window_module, "decode_barcodes", lambda frame, enabled_labels: [detection])
+    monkeypatch.setattr(main_window_module, "decode_barcodes", lambda frame, enabled_labels, decoder_name="Auto": [detection])
 
     frame = np.zeros((16, 16, 3), dtype=np.uint8)
     window._update_frames(frame, None)
@@ -309,6 +445,145 @@ def test_barcode_detection_updates_preview_and_confirmed_result(monkeypatch):
     assert "Barcode confirmed: ABC123 (Code 128)" in window.status_box.toPlainText()
     assert window.left_view._last_frame is not None
     assert np.array_equal(window.left_view._last_frame[2, 2], np.array([0, 255, 0], dtype=np.uint8))
+
+
+def test_barcode_detection_logs_roi_position_and_content_for_multiple_codes(monkeypatch):
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow(load_config())
+    window.view_mode.setCurrentText("Barcode Detection")
+    window.barcode_confirm_frames.setValue(1)
+    detections = [
+        BarcodeDetection(text="ABC123", format="Code 128", points=((2, 2), (8, 2), (8, 8), (2, 8))),
+        BarcodeDetection(text="QR-002", format="QR Code", points=((10, 4), (15, 4), (15, 12), (10, 12))),
+    ]
+
+    monkeypatch.setattr(main_window_module, "decode_barcodes", lambda frame, enabled_labels, decoder_name="Auto": detections)
+
+    frame = np.zeros((20, 20, 3), dtype=np.uint8)
+    window._update_frames(frame, None)
+    log_text = window.status_box.toPlainText()
+
+    assert app is not None
+    assert "ROI 1 | Code 128 | ABC123 | bbox x=2, y=2, w=6, h=6" in log_text
+    assert "points=(2,2), (8,2), (8,8), (2,8)" in log_text
+    assert "ROI 2 | QR Code | QR-002 | bbox x=10, y=4, w=5, h=8" in log_text
+    assert "points=(10,4), (15,4), (15,12), (10,12)" in log_text
+    assert window.barcode_info.text() == "ROI 1: ABC123 (Code 128)\nROI 2: QR-002 (QR Code)"
+    assert window.left_view._last_frame is not None
+    assert not np.array_equal(window.left_view._last_frame[2, 2], window.left_view._last_frame[10, 10])
+
+
+def test_barcode_detection_mode_uses_single_zoomable_preview_window():
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow(load_config())
+    window.show()
+    app.processEvents()
+
+    window.view_mode.setCurrentText("Barcode Detection")
+    app.processEvents()
+
+    assert app is not None
+    assert window.left_view.isVisible() is True
+    assert window.right_view.isVisible() is False
+    assert window.left_view.zoom_enabled is True
+
+
+def test_barcode_detection_preview_keeps_original_frame_size(monkeypatch):
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow(load_config())
+    window.view_mode.setCurrentText("Barcode Detection")
+    monkeypatch.setattr(main_window_module, "decode_barcodes", lambda frame, enabled_labels, decoder_name="Auto": [])
+
+    frame = np.zeros((960, 1280, 3), dtype=np.uint8)
+    window._update_frames(frame, None)
+
+    assert app is not None
+    assert window.left_view._last_frame is not None
+    assert window.left_view._last_frame.shape == (960, 1280, 3)
+
+
+def test_barcode_debug_loads_image_file_and_updates_result(monkeypatch, tmp_path):
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow(load_config())
+    window.view_mode.setCurrentText("Barcode Detection")
+    image_path = tmp_path / "qr.bmp"
+    image_path.write_bytes(b"fake image")
+    frame = np.zeros((16, 16, 3), dtype=np.uint8)
+    detection = BarcodeDetection(text="IMG-123", format="QR Code", points=((2, 2), (8, 2), (8, 8), (2, 8)))
+    calls = {}
+
+    monkeypatch.setattr(
+        main_window_module.QFileDialog,
+        "getOpenFileName",
+        lambda *args, **kwargs: (str(image_path), "Images (*.png *.jpg *.jpeg *.bmp *.tif *.tiff)"),
+    )
+    monkeypatch.setattr(main_window_module.cv2, "imread", lambda path, flags: frame.copy())
+
+    def fake_decode(image, enabled_labels, decoder_name="Auto"):  # noqa: ANN001
+        calls["enabled_labels"] = enabled_labels
+        calls["decoder_name"] = decoder_name
+        assert np.array_equal(image, frame)
+        return [detection]
+
+    monkeypatch.setattr(main_window_module, "decode_barcodes", fake_decode)
+
+    window._load_barcode_debug_image()
+
+    assert app is not None
+    assert calls["enabled_labels"] == list(SUPPORTED_BARCODE_LABELS)
+    assert window.latest_left is not None
+    assert window.latest_right is None
+    assert window.distance_state.text() == "Barcode: IMG-123"
+    assert window.barcode_info.text() == "ROI 1: IMG-123 (QR Code)"
+    assert window.preview_info.text() == "Barcode Image Debug"
+    assert "Barcode image decoded: IMG-123 (QR Code)" in window.status_box.toPlainText()
+    assert window.left_view._last_frame is not None
+    assert np.array_equal(window.left_view._last_frame[2, 2], np.array([0, 255, 0], dtype=np.uint8))
+
+
+def test_barcode_debug_loads_image_file_when_imread_rejects_unicode_path(monkeypatch, tmp_path):
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow(load_config())
+    image_path = tmp_path / "二维码.bmp"
+    image_path.write_bytes(b"fake encoded image")
+    decoded_image = np.zeros((10, 10, 3), dtype=np.uint8)
+
+    monkeypatch.setattr(
+        main_window_module.QFileDialog,
+        "getOpenFileName",
+        lambda *args, **kwargs: (str(image_path), "Images (*.png *.jpg *.jpeg *.bmp *.tif *.tiff)"),
+    )
+    monkeypatch.setattr(main_window_module.cv2, "imread", lambda path, flags: None)
+    monkeypatch.setattr(main_window_module.cv2, "imdecode", lambda data, flags: decoded_image)
+    monkeypatch.setattr(main_window_module, "decode_barcodes", lambda image, formats=None, decoder_name="Auto": [])
+
+    window._load_barcode_debug_image()
+
+    assert app is not None
+    assert window.latest_left is decoded_image
+    assert window.preview_info.text() == "Barcode Image Debug"
+    assert "Failed to read image" not in window.status_box.toPlainText()
+
+
+def test_barcode_debug_reports_unreadable_image_file(monkeypatch, tmp_path):
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow(load_config())
+    image_path = tmp_path / "broken.bmp"
+    image_path.write_bytes(b"not an image")
+
+    monkeypatch.setattr(
+        main_window_module.QFileDialog,
+        "getOpenFileName",
+        lambda *args, **kwargs: (str(image_path), "Images (*.png *.jpg *.jpeg *.bmp *.tif *.tiff)"),
+    )
+    monkeypatch.setattr(main_window_module.cv2, "imread", lambda path, flags: None)
+    monkeypatch.setattr(main_window_module.QMessageBox, "warning", lambda *args, **kwargs: None)
+
+    window._load_barcode_debug_image()
+
+    assert app is not None
+    assert f"Failed to read image: {image_path}" in window.status_box.toPlainText()
+    assert window.latest_left is None
 
 
 def test_view_mode_enabled_allows_barcode_detection_without_calibration():
@@ -676,6 +951,46 @@ def test_image_view_maps_clicks_with_source_offset_for_cropped_depth_view():
 
     assert app is not None
     assert view.map_label_point_to_image(view.rect().center()) == (415, 239)
+
+
+def test_image_view_zoom_can_go_below_one_to_one_and_defaults_to_fit():
+    app = QApplication.instance() or QApplication([])
+    view = ImageView("Preview")
+    view.resize(640, 480)
+    frame = np.zeros((960, 1280, 3), dtype=np.uint8)
+    view.set_frame(frame)
+    view.set_zoom_enabled(True)
+
+    fitted_size = view.pixmap().size()
+    view.zoom_by(0.5)
+    zoomed_out_size = view.pixmap().size()
+
+    assert app is not None
+    assert view.zoom_factor == 0.5
+    assert fitted_size.width() == 640
+    assert fitted_size.height() == 480
+    assert zoomed_out_size.width() == 320
+    assert zoomed_out_size.height() == 240
+    assert view.map_label_point_to_image(QPoint(320, 240)) == (640, 480)
+
+
+def test_image_view_pan_moves_visible_image_center_when_zoomed_in():
+    app = QApplication.instance() or QApplication([])
+    view = ImageView("Preview")
+    view.resize(640, 480)
+    frame = np.zeros((960, 1280, 3), dtype=np.uint8)
+    view.set_frame(frame)
+    view.set_zoom_enabled(True)
+    view.zoom_by(2.0)
+
+    before = view.map_label_point_to_image(QPoint(320, 240))
+    view.pan_by(80, 40)
+    after = view.map_label_point_to_image(QPoint(320, 240))
+
+    assert app is not None
+    assert before == (640, 480)
+    assert after[0] < before[0]
+    assert after[1] < before[1]
 
 
 def test_camera_stats_use_preview_overlays_and_short_bottom_summary():
