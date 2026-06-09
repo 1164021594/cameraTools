@@ -209,6 +209,25 @@ def test_preprocess_controls_update_preprocessed_preview(monkeypatch, tmp_path):
     assert int(window.image_view._last_frame[0, 20, 0]) == 255
 
 
+def test_preprocess_numeric_parameters_update_preview_immediately(monkeypatch, tmp_path):
+    app = QApplication.instance() or QApplication([])
+    image_path = tmp_path / "sample.bmp"
+    image_path.write_bytes(b"fake")
+    frame = np.zeros((20, 30, 3), dtype=np.uint8)
+    monkeypatch.setattr(debugger_window_module, "read_image_color", lambda path: frame.copy())
+    window = DecoderDebuggerWindow()
+
+    window.load_image_path(image_path)
+    window.preview_view_mode.setCurrentText("Preprocessed")
+    window.scale_factor.setValue(2.0)
+
+    assert app is not None
+    assert window.preprocess_config.view == "Preprocessed"
+    assert window.preprocess_config.scale_factor == 2.0
+    assert window.image_view._last_frame is not None
+    assert window.image_view._last_frame.shape[:2] == (40, 60)
+
+
 def test_find_code_uses_preprocessed_input_when_selected(monkeypatch, tmp_path):
     app = QApplication.instance() or QApplication([])
     image_path = tmp_path / "sample.bmp"

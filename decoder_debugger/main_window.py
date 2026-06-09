@@ -6,7 +6,9 @@ from time import perf_counter
 import cv2
 import numpy as np
 from PySide6.QtWidgets import (
+    QCheckBox,
     QComboBox,
+    QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
     QGroupBox,
@@ -15,6 +17,7 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QPushButton,
+    QScrollArea,
     QSpinBox,
     QTabWidget,
     QTextEdit,
@@ -72,14 +75,17 @@ class DecoderDebuggerWindow(QMainWindow):
         open_folder.clicked.connect(self.open_folder)
         self.preview_view_mode = QComboBox()
         self.preview_view_mode.addItems(("Original", "Preprocessed"))
-        self.preview_view_mode.currentTextChanged.connect(lambda _text: self._refresh_preprocess_preview())
+        self.preview_view_mode.currentTextChanged.connect(lambda _text: self._preprocess_controls_changed())
         self.path_label = QLabel("No image loaded")
         self.path_label.setWordWrap(True)
         controls.addWidget(open_image)
         controls.addWidget(open_folder)
         controls.addWidget(QLabel("Preview View"))
         controls.addWidget(self.preview_view_mode)
-        controls.addWidget(self._operator_group())
+        operator_scroll = QScrollArea()
+        operator_scroll.setWidgetResizable(True)
+        operator_scroll.setWidget(self._operator_group())
+        controls.addWidget(operator_scroll, stretch=1)
         save_preset = QPushButton("Save Preset")
         save_preset.clicked.connect(self._save_preprocess_preset_dialog)
         load_preset = QPushButton("Load Preset")
@@ -87,7 +93,6 @@ class DecoderDebuggerWindow(QMainWindow):
         controls.addWidget(save_preset)
         controls.addWidget(load_preset)
         controls.addWidget(self.path_label)
-        controls.addStretch(1)
 
         self.image_view = ImageView("Preprocess preview")
         self.image_view.set_zoom_enabled(True)
@@ -109,9 +114,87 @@ class DecoderDebuggerWindow(QMainWindow):
         self.manual_threshold.setRange(0, 255)
         self.manual_threshold.setValue(128)
         self.manual_threshold.valueChanged.connect(lambda _value: self._preprocess_controls_changed())
+        self.threshold_invert = QCheckBox()
+        self.threshold_invert.stateChanged.connect(lambda _value: self._preprocess_controls_changed())
+        self.adaptive_block_size = QSpinBox()
+        self.adaptive_block_size.setRange(3, 201)
+        self.adaptive_block_size.setSingleStep(2)
+        self.adaptive_block_size.setValue(21)
+        self.adaptive_block_size.valueChanged.connect(lambda _value: self._preprocess_controls_changed())
+        self.adaptive_c = QSpinBox()
+        self.adaptive_c.setRange(-30, 30)
+        self.adaptive_c.setValue(4)
+        self.adaptive_c.valueChanged.connect(lambda _value: self._preprocess_controls_changed())
+        self.clahe_enabled = QCheckBox()
+        self.clahe_enabled.stateChanged.connect(lambda _value: self._preprocess_controls_changed())
+        self.clahe_clip_limit = QDoubleSpinBox()
+        self.clahe_clip_limit.setRange(0.1, 20.0)
+        self.clahe_clip_limit.setSingleStep(0.1)
+        self.clahe_clip_limit.setValue(2.0)
+        self.clahe_clip_limit.valueChanged.connect(lambda _value: self._preprocess_controls_changed())
+        self.clahe_tile_size = QSpinBox()
+        self.clahe_tile_size.setRange(1, 64)
+        self.clahe_tile_size.setValue(8)
+        self.clahe_tile_size.valueChanged.connect(lambda _value: self._preprocess_controls_changed())
+        self.blur_mode = QComboBox()
+        self.blur_mode.addItems(("None", "Gaussian", "Median"))
+        self.blur_mode.currentTextChanged.connect(lambda _text: self._preprocess_controls_changed())
+        self.blur_kernel = QSpinBox()
+        self.blur_kernel.setRange(1, 31)
+        self.blur_kernel.setSingleStep(2)
+        self.blur_kernel.setValue(3)
+        self.blur_kernel.valueChanged.connect(lambda _value: self._preprocess_controls_changed())
+        self.sharpen_enabled = QCheckBox()
+        self.sharpen_enabled.stateChanged.connect(lambda _value: self._preprocess_controls_changed())
+        self.sharpen_strength = QDoubleSpinBox()
+        self.sharpen_strength.setRange(1.0, 5.0)
+        self.sharpen_strength.setSingleStep(0.1)
+        self.sharpen_strength.setValue(1.5)
+        self.sharpen_strength.valueChanged.connect(lambda _value: self._preprocess_controls_changed())
+        self.sharpen_radius = QDoubleSpinBox()
+        self.sharpen_radius.setRange(0.1, 10.0)
+        self.sharpen_radius.setSingleStep(0.1)
+        self.sharpen_radius.setValue(1.0)
+        self.sharpen_radius.valueChanged.connect(lambda _value: self._preprocess_controls_changed())
+        self.morphology = QComboBox()
+        self.morphology.addItems(("None", "Erode", "Dilate", "Open", "Close"))
+        self.morphology.currentTextChanged.connect(lambda _text: self._preprocess_controls_changed())
+        self.morphology_kernel = QSpinBox()
+        self.morphology_kernel.setRange(1, 31)
+        self.morphology_kernel.setValue(3)
+        self.morphology_kernel.valueChanged.connect(lambda _value: self._preprocess_controls_changed())
+        self.morphology_iterations = QSpinBox()
+        self.morphology_iterations.setRange(1, 10)
+        self.morphology_iterations.setValue(1)
+        self.morphology_iterations.valueChanged.connect(lambda _value: self._preprocess_controls_changed())
+        self.scale_factor = QDoubleSpinBox()
+        self.scale_factor.setRange(0.25, 8.0)
+        self.scale_factor.setSingleStep(0.25)
+        self.scale_factor.setValue(1.0)
+        self.scale_factor.valueChanged.connect(lambda _value: self._preprocess_controls_changed())
+        self.quiet_zone_padding = QSpinBox()
+        self.quiet_zone_padding.setRange(0, 512)
+        self.quiet_zone_padding.setValue(0)
+        self.quiet_zone_padding.valueChanged.connect(lambda _value: self._preprocess_controls_changed())
         form.addRow("Channel", self.channel_select)
+        form.addRow("CLAHE", self.clahe_enabled)
+        form.addRow("CLAHE clip", self.clahe_clip_limit)
+        form.addRow("CLAHE tile", self.clahe_tile_size)
+        form.addRow("Blur", self.blur_mode)
+        form.addRow("Blur kernel", self.blur_kernel)
+        form.addRow("Sharpen", self.sharpen_enabled)
+        form.addRow("Sharpen strength", self.sharpen_strength)
+        form.addRow("Sharpen radius", self.sharpen_radius)
         form.addRow("Threshold", self.threshold_mode)
         form.addRow("Manual value", self.manual_threshold)
+        form.addRow("Adaptive block", self.adaptive_block_size)
+        form.addRow("Adaptive C", self.adaptive_c)
+        form.addRow("Invert threshold", self.threshold_invert)
+        form.addRow("Morphology", self.morphology)
+        form.addRow("Morph kernel", self.morphology_kernel)
+        form.addRow("Morph iterations", self.morphology_iterations)
+        form.addRow("Scale", self.scale_factor)
+        form.addRow("Quiet zone padding", self.quiet_zone_padding)
         return group
 
     def _find_decode_tab(self) -> QWidget:
@@ -169,8 +252,24 @@ class DecoderDebuggerWindow(QMainWindow):
         self.preprocess_config = PreprocessConfig(
             view=self.preview_view_mode.currentText(),
             channel=self.channel_select.currentText(),
+            clahe_enabled=self.clahe_enabled.isChecked(),
+            clahe_clip_limit=self.clahe_clip_limit.value(),
+            clahe_tile_size=self.clahe_tile_size.value(),
+            blur_mode=self.blur_mode.currentText(),
+            blur_kernel=self.blur_kernel.value(),
+            sharpen_enabled=self.sharpen_enabled.isChecked(),
+            sharpen_strength=self.sharpen_strength.value(),
+            sharpen_radius=self.sharpen_radius.value(),
             threshold_mode=self.threshold_mode.currentText(),
+            adaptive_block_size=self.adaptive_block_size.value(),
+            adaptive_c=self.adaptive_c.value(),
             manual_threshold=self.manual_threshold.value(),
+            threshold_invert=self.threshold_invert.isChecked(),
+            morphology=self.morphology.currentText(),
+            morphology_kernel=self.morphology_kernel.value(),
+            morphology_iterations=self.morphology_iterations.value(),
+            scale_factor=self.scale_factor.value(),
+            quiet_zone_padding=self.quiet_zone_padding.value(),
         )
         self._refresh_preprocess_preview()
 
@@ -243,8 +342,24 @@ class DecoderDebuggerWindow(QMainWindow):
         self.preprocess_config = config
         self.preview_view_mode.setCurrentText(config.view)
         self.channel_select.setCurrentText(config.channel)
+        self.clahe_enabled.setChecked(config.clahe_enabled)
+        self.clahe_clip_limit.setValue(config.clahe_clip_limit)
+        self.clahe_tile_size.setValue(config.clahe_tile_size)
+        self.blur_mode.setCurrentText(config.blur_mode)
+        self.blur_kernel.setValue(config.blur_kernel)
+        self.sharpen_enabled.setChecked(config.sharpen_enabled)
+        self.sharpen_strength.setValue(config.sharpen_strength)
+        self.sharpen_radius.setValue(config.sharpen_radius)
         self.threshold_mode.setCurrentText(config.threshold_mode)
+        self.adaptive_block_size.setValue(config.adaptive_block_size)
+        self.adaptive_c.setValue(config.adaptive_c)
         self.manual_threshold.setValue(config.manual_threshold)
+        self.threshold_invert.setChecked(config.threshold_invert)
+        self.morphology.setCurrentText(config.morphology)
+        self.morphology_kernel.setValue(config.morphology_kernel)
+        self.morphology_iterations.setValue(config.morphology_iterations)
+        self.scale_factor.setValue(config.scale_factor)
+        self.quiet_zone_padding.setValue(config.quiet_zone_padding)
         self._refresh_preprocess_preview()
 
     def _save_preprocess_preset_dialog(self) -> None:
