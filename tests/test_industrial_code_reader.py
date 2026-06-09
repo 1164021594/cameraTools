@@ -91,6 +91,31 @@ def test_datamatrix_decoder_native_method_does_not_call_zxing(monkeypatch):
     assert results[0].quality["backend"] == "native"
 
 
+def test_native_datamatrix_decoder_reads_generated_ascii_symbol():
+    import zxingcpp
+
+    barcode = zxingcpp.create_barcode("DM123", zxingcpp.BarcodeFormat.DataMatrix)
+    image = np.array(zxingcpp.write_barcode_to_image(barcode, scale=8))
+
+    results = DataMatrixDecoder(method="native").decode(image, DecodeOptions())
+
+    assert results
+    assert results[0].text == "DM123"
+    assert results[0].quality["backend"] == "native"
+
+
+def test_native_datamatrix_decoder_reports_failure_for_blank_image():
+    image = np.full((80, 80), 255, dtype=np.uint8)
+
+    results = DataMatrixDecoder(method="native").decode(image, DecodeOptions(return_failures=True))
+
+    assert results
+    assert results[0].text == ""
+    assert results[0].failure_reason == "Native DataMatrix decoder is not complete yet"
+    assert results[0].quality["backend"] == "native"
+    assert results[0].quality["failures"]
+
+
 def test_datamatrix_decoder_auto_falls_back_to_zxing_when_native_finds_nothing(monkeypatch):
     class FakeBarcode:
         valid = True
