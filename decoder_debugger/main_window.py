@@ -212,6 +212,8 @@ class DecoderDebuggerWindow(QMainWindow):
         self.find_input_view.addItems(("Original", "Preprocessed"))
         find_button = QPushButton("Find Code")
         find_button.clicked.connect(self.find_code)
+        decode_all_button = QPushButton("Decode All Candidate ROIs")
+        decode_all_button.clicked.connect(self.decode_all_rois)
         decode_button = QPushButton("Decode Selected ROI")
         decode_button.clicked.connect(self.decode_selected_roi)
         self.find_decode_view = ImageView("Find / Decode")
@@ -223,6 +225,7 @@ class DecoderDebuggerWindow(QMainWindow):
         controls.addWidget(QLabel("Input View"))
         controls.addWidget(self.find_input_view)
         controls.addWidget(find_button)
+        controls.addWidget(decode_all_button)
         controls.addWidget(decode_button)
         controls.addStretch(1)
         layout.addLayout(controls, stretch=0)
@@ -371,6 +374,26 @@ class DecoderDebuggerWindow(QMainWindow):
         self.timing_label.setText(f"Total {elapsed_ms:.1f} ms | Decode Selected ROI {elapsed_ms:.1f} ms")
         self.find_decode_result_box.setPlainText(self._result_text() + f"\nDecode Selected ROI: {elapsed_ms:.1f} ms")
 
+    def decode_all_rois(self) -> None:
+        image = self._selected_input_image()
+        if image is None:
+            self.find_decode_result_box.setPlainText("Load an image first.")
+            return
+        if not self.current_rois:
+            self.find_decode_result_box.setPlainText("Run Find Code first.")
+            return
+        start = perf_counter()
+        engine = CodeReaderEngine([DataMatrixDecoder()])
+        self.current_results = engine.decode(
+            image,
+            DecodeOptions(rois=self.current_rois, max_results=16, max_rois=len(self.current_rois), return_failures=True),
+        )
+        elapsed_ms = (perf_counter() - start) * 1000.0
+        overlay = draw_debug_overlay(image, self.current_rois, self.current_results, selected_roi_id=self.selected_roi_id)
+        self.find_decode_view.set_frame(overlay)
+        self.timing_label.setText(f"Total {elapsed_ms:.1f} ms | Decode All Candidate ROIs {elapsed_ms:.1f} ms")
+        self.find_decode_result_box.setPlainText(self._result_text() + f"\nDecode All Candidate ROIs: {elapsed_ms:.1f} ms")
+
     def _selected_roi(self) -> Roi:
         if self.selected_roi_id is not None:
             for roi in self.current_rois:
@@ -433,7 +456,7 @@ class DecoderDebuggerWindow(QMainWindow):
 
     def run_decode(self) -> None:
         self.find_code()
-        self.decode_selected_roi()
+        self.decode_all_rois()
 
     def _result_text(self) -> str:
         successful = [result for result in self.current_results if result.text]

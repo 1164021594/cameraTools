@@ -326,6 +326,40 @@ def test_decode_selected_roi_decodes_only_selected_roi(monkeypatch, tmp_path):
     assert "ROI2" in window.find_decode_result_box.toPlainText()
 
 
+def test_decode_all_rois_decodes_every_candidate_roi(monkeypatch, tmp_path):
+    app = QApplication.instance() or QApplication([])
+    image_path = tmp_path / "sample.bmp"
+    image_path.write_bytes(b"fake")
+    frame = np.zeros((40, 50, 3), dtype=np.uint8)
+    rois = (
+        Roi(id=1, x=5, y=6, width=10, height=10),
+        Roi(id=2, x=20, y=10, width=12, height=12),
+    )
+    results = [CodeResult(text="ROI2", symbology="DataMatrix", roi_id=2, bbox=(20, 10, 12, 12), preprocessing="fake")]
+    captured = {}
+    monkeypatch.setattr(debugger_window_module, "read_image_color", lambda path: frame.copy())
+
+    class FakeEngine:
+        def __init__(self, decoders):  # noqa: ANN001
+            pass
+
+        def decode(self, image, options):  # noqa: ANN001
+            captured["rois"] = options.rois
+            return results
+
+    monkeypatch.setattr(debugger_window_module, "CodeReaderEngine", FakeEngine)
+    window = DecoderDebuggerWindow()
+    window.load_image_path(image_path)
+    window.current_rois = rois
+
+    window.decode_all_rois()
+
+    assert app is not None
+    assert captured["rois"] == rois
+    assert "Decoded Text:" in window.find_decode_result_box.toPlainText()
+    assert "ROI2" in window.find_decode_result_box.toPlainText()
+
+
 def test_decode_result_panel_shows_decoded_text_prominently(monkeypatch, tmp_path):
     app = QApplication.instance() or QApplication([])
     image_path = tmp_path / "sample.bmp"
