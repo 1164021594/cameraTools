@@ -108,6 +108,29 @@ def test_engine_decodes_supplied_rois_and_offsets_result_coordinates(monkeypatch
     assert results[0].points == ((12, 23), (16, 23), (16, 28), (12, 28))
 
 
+def test_engine_assigns_clipped_roi_id_when_decoder_reports_default_roi_id():
+    class FakeDecoder:
+        symbology = "DataMatrix"
+
+        def decode(self, image, options):  # noqa: ANN001
+            return [
+                CodeResult(
+                    text="ROI-11-CODE",
+                    symbology="DataMatrix",
+                    roi_id=1,
+                    bbox=(1, 2, 3, 4),
+                    preprocessing="fake",
+                )
+            ]
+
+    image = np.zeros((100, 120, 3), dtype=np.uint8)
+    engine = CodeReaderEngine(decoders=[FakeDecoder()])
+
+    results = engine.decode(image, DecodeOptions(rois=(Roi(id=11, x=10, y=20, width=30, height=40),)))
+
+    assert results[0].roi_id == 11
+
+
 def test_datamatrix_roi_generator_finds_dense_square_candidate():
     image = np.full((120, 160), 255, dtype=np.uint8)
     cell = 4

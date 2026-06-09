@@ -326,6 +326,36 @@ def test_decode_selected_roi_decodes_only_selected_roi(monkeypatch, tmp_path):
     assert "ROI2" in window.find_decode_result_box.toPlainText()
 
 
+def test_decode_result_panel_shows_decoded_text_prominently(monkeypatch, tmp_path):
+    app = QApplication.instance() or QApplication([])
+    image_path = tmp_path / "sample.bmp"
+    image_path.write_bytes(b"fake")
+    frame = np.zeros((40, 50, 3), dtype=np.uint8)
+    rois = (Roi(id=11, x=5, y=6, width=10, height=10),)
+    results = [CodeResult(text="JMB3404T", symbology="DataMatrix", roi_id=11, bbox=(5, 6, 10, 10), preprocessing="fake")]
+    monkeypatch.setattr(debugger_window_module, "read_image_color", lambda path: frame.copy())
+
+    class FakeEngine:
+        def __init__(self, decoders):  # noqa: ANN001
+            pass
+
+        def decode(self, image, options):  # noqa: ANN001
+            return results
+
+    monkeypatch.setattr(debugger_window_module, "CodeReaderEngine", FakeEngine)
+    window = DecoderDebuggerWindow()
+    window.load_image_path(image_path)
+    window.current_rois = rois
+    window.selected_roi_id = 11
+
+    window.decode_selected_roi()
+
+    text = window.find_decode_result_box.toPlainText()
+    assert app is not None
+    assert "Decoded Text:" in text
+    assert "JMB3404T" in text
+
+
 def test_preprocess_preset_save_and_load_updates_controls(tmp_path):
     app = QApplication.instance() or QApplication([])
     preset_path = tmp_path / "preset.json"

@@ -436,7 +436,13 @@ class DecoderDebuggerWindow(QMainWindow):
         self.decode_selected_roi()
 
     def _result_text(self) -> str:
+        successful = [result for result in self.current_results if result.text]
         lines = [f"Candidates: {len(self.current_rois)}", f"Results: {len(self.current_results)}"]
+        if successful:
+            lines.append("Decoded Text:")
+            for result in successful:
+                lines.append(f"  ROI {result.roi_id}: {result.text}")
+            lines.append("")
         for result in self.current_results:
             if result.failure_reason:
                 lines.append(f"ROI {result.roi_id}: failed - {result.failure_reason}")

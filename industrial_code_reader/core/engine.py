@@ -59,7 +59,7 @@ class CodeReaderEngine:
             if not roi_results and decode_options.return_failures:
                 roi_results = [_failure_result(clipped)]
             for result in roi_results:
-                results.append(_offset_result(result, clipped.x, clipped.y))
+                results.append(_offset_result(result, clipped.x, clipped.y, clipped.id))
                 if result.text and len([item for item in results if item.text]) >= decode_options.max_results:
                     return results[: decode_options.max_results]
         return results
@@ -77,7 +77,7 @@ def _clip_roi(roi: Roi, image_width: int, image_height: int) -> Roi | None:
     return Roi(id=roi.id, x=x, y=y, width=width, height=height, quality=roi.quality)
 
 
-def _offset_result(result: CodeResult, x_offset: int, y_offset: int) -> CodeResult:
+def _offset_result(result: CodeResult, x_offset: int, y_offset: int, roi_id: int | None = None) -> CodeResult:
     bbox = None
     if result.bbox is not None:
         x, y, width, height = result.bbox
@@ -88,7 +88,7 @@ def _offset_result(result: CodeResult, x_offset: int, y_offset: int) -> CodeResu
     return CodeResult(
         text=result.text,
         symbology=result.symbology,
-        roi_id=result.roi_id,
+        roi_id=roi_id if roi_id is not None else result.roi_id,
         bbox=bbox,
         points=points,
         confidence=result.confidence,
