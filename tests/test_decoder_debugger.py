@@ -272,3 +272,23 @@ def test_decode_selected_roi_decodes_only_selected_roi(monkeypatch, tmp_path):
     assert app is not None
     assert captured["rois"] == (rois[1],)
     assert "ROI2" in window.find_decode_result_box.toPlainText()
+
+
+def test_preprocess_preset_save_and_load_updates_controls(tmp_path):
+    app = QApplication.instance() or QApplication([])
+    preset_path = tmp_path / "preset.json"
+    window = DecoderDebuggerWindow()
+    window.channel_select.setCurrentText("HSV Saturation")
+    window.threshold_mode.setCurrentText("Manual")
+    window.manual_threshold.setValue(88)
+
+    window.save_preprocess_preset(preset_path)
+    window.channel_select.setCurrentText("Original")
+    window.threshold_mode.setCurrentText("None")
+    window.manual_threshold.setValue(128)
+    window.load_preprocess_preset(preset_path)
+
+    assert app is not None
+    assert window.channel_select.currentText() == "HSV Saturation"
+    assert window.threshold_mode.currentText() == "Manual"
+    assert window.manual_threshold.value() == 88

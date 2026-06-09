@@ -30,7 +30,13 @@ from stereo_aruco_gui.app.image_view import ImageView
 
 from decoder_debugger.image_io import list_image_files, read_image_color
 from decoder_debugger.overlay import draw_debug_overlay
-from decoder_debugger.preprocess import PreprocessConfig, PreprocessResult, apply_preprocess
+from decoder_debugger.preprocess import (
+    PreprocessConfig,
+    PreprocessResult,
+    apply_preprocess,
+    config_from_json,
+    config_to_json,
+)
 
 
 class DecoderDebuggerWindow(QMainWindow):
@@ -74,6 +80,12 @@ class DecoderDebuggerWindow(QMainWindow):
         controls.addWidget(QLabel("Preview View"))
         controls.addWidget(self.preview_view_mode)
         controls.addWidget(self._operator_group())
+        save_preset = QPushButton("Save Preset")
+        save_preset.clicked.connect(self._save_preprocess_preset_dialog)
+        load_preset = QPushButton("Load Preset")
+        load_preset.clicked.connect(self._load_preprocess_preset_dialog)
+        controls.addWidget(save_preset)
+        controls.addWidget(load_preset)
         controls.addWidget(self.path_label)
         controls.addStretch(1)
 
@@ -221,6 +233,29 @@ class DecoderDebuggerWindow(QMainWindow):
                 if roi.id == self.selected_roi_id:
                     return roi
         return self.current_rois[0]
+
+    def save_preprocess_preset(self, path: str | Path) -> None:
+        self._preprocess_controls_changed()
+        Path(path).write_text(config_to_json(self.preprocess_config), encoding="utf-8")
+
+    def load_preprocess_preset(self, path: str | Path) -> None:
+        config = config_from_json(Path(path).read_text(encoding="utf-8"))
+        self.preprocess_config = config
+        self.preview_view_mode.setCurrentText(config.view)
+        self.channel_select.setCurrentText(config.channel)
+        self.threshold_mode.setCurrentText(config.threshold_mode)
+        self.manual_threshold.setValue(config.manual_threshold)
+        self._refresh_preprocess_preview()
+
+    def _save_preprocess_preset_dialog(self) -> None:
+        path, _ = QFileDialog.getSaveFileName(self, "Save Preprocess Preset", "", "JSON (*.json)")
+        if path:
+            self.save_preprocess_preset(path)
+
+    def _load_preprocess_preset_dialog(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(self, "Load Preprocess Preset", "", "JSON (*.json)")
+        if path:
+            self.load_preprocess_preset(path)
 
     def open_image(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
