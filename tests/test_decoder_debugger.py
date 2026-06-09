@@ -14,6 +14,7 @@ from PySide6.QtWidgets import QApplication
 import decoder_debugger.main_window as debugger_window_module
 import decoder_debugger.main as debugger_main_module
 from decoder_debugger.main_window import DecoderDebuggerWindow
+from decoder_debugger.preprocess import PreprocessConfig, apply_preprocess, config_from_json, config_to_json
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -122,3 +123,52 @@ def test_main_creates_decoder_debugger_window(monkeypatch):
 
     assert debugger_main_module.main(["decoder"]) == 0
     assert created == {"argv": ["decoder"], "shown": True}
+
+
+def test_preprocess_config_defaults_show_original_without_processing():
+    config = PreprocessConfig()
+
+    assert config.view == "Original"
+    assert config.channel == "Original"
+    assert config.threshold_mode == "None"
+    assert config.morphology == "None"
+
+
+def test_apply_preprocess_returns_stage_images_and_threshold_result():
+    image = np.zeros((20, 30, 3), dtype=np.uint8)
+    image[:, :15] = (20, 20, 20)
+    image[:, 15:] = (220, 220, 220)
+    config = PreprocessConfig(channel="Gray", threshold_mode="Manual", manual_threshold=100)
+
+    result = apply_preprocess(image, config)
+
+    assert result.output.shape == (20, 30)
+    assert "Original" in result.stages
+    assert "Gray" in result.stages
+    assert "Threshold" in result.stages
+    assert int(result.output[0, 0]) == 0
+    assert int(result.output[0, 20]) == 255
+    assert result.timings_ms
+
+
+def test_preprocess_config_json_round_trip():
+    config = PreprocessConfig(
+        view="Preprocessed",
+        channel="HSV Saturation",
+        clahe_enabled=True,
+        clahe_clip_limit=3.0,
+        blur_mode="Gaussian",
+        blur_kernel=5,
+        threshold_mode="Adaptive",
+        adaptive_block_size=31,
+        adaptive_c=5,
+        morphology="Open",
+        morphology_kernel=3,
+        morphology_iterations=2,
+        scale_factor=2.0,
+        quiet_zone_padding=8,
+    )
+
+    loaded = config_from_json(config_to_json(config))
+
+    assert loaded == config
