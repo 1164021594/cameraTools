@@ -37,7 +37,6 @@ class DataMatrixRoiGenerator:
             module_texture = _module_texture(gray, roi)
             if module_texture < 0.08:
                 continue
-            finder_score = _finder_pattern_score(gray, roi)
             dark_ratio = _dark_ratio(gray, roi)
             if dark_ratio < 0.08 or dark_ratio > 0.92:
                 continue
@@ -47,19 +46,11 @@ class DataMatrixRoiGenerator:
                 y=roi.y,
                 width=roi.width,
                 height=roi.height,
-                quality={
-                    "area": area,
-                    "aspect": aspect,
-                    "edge_density": density,
-                    "module_texture": module_texture,
-                    "finder_score": finder_score,
-                    "dark_ratio": dark_ratio,
-                },
+                quality={"area": area, "aspect": aspect, "edge_density": density, "module_texture": module_texture, "dark_ratio": dark_ratio},
             )
-            score = area * (density + module_texture * 2.0) * (0.35 + finder_score * 6.0)
+            score = area * (density + module_texture * 2.0)
             candidates.append((score, roi))
         candidates.extend(_mser_saturation_candidates(image, gray, edges, self.min_area, self.max_area, self.padding))
-        candidates = _merge_overlapping_candidates(candidates, width, height)
         candidates = _deduplicate_candidates(candidates)
         candidates.sort(key=lambda item: item[0], reverse=True)
         return tuple(roi for _, roi in candidates[: self.max_rois])
@@ -102,24 +93,6 @@ def _dark_ratio(gray: np.ndarray, roi: Roi) -> float:
     return float(np.mean(binary == 0))
 
 
-def _finder_pattern_score(gray: np.ndarray, roi: Roi) -> float:
-    binary = _threshold_patch(gray, roi)
-    if binary.shape[0] < 10 or binary.shape[1] < 10:
-        return 0.0
-    dark = binary == 0
-    border = max(2, round(min(binary.shape[:2]) * 0.12))
-    left = float(np.mean(dark[:, :border]))
-    bottom = float(np.mean(dark[-border:, :]))
-    top = float(np.mean(dark[:border, :]))
-    right = float(np.mean(dark[:, -border:]))
-    solid_l = (left + bottom) / 2.0
-    alternating_edges = 1.0 - abs(top - 0.5) * 2.0
-    alternating_edges += 1.0 - abs(right - 0.5) * 2.0
-    alternating_edges /= 2.0
-    squareness = min(roi.width, roi.height) / max(roi.width, roi.height, 1)
-    return max(0.0, solid_l) * max(0.0, alternating_edges) * float(squareness)
-
-
 def _mser_saturation_candidates(
     image: np.ndarray,
     gray: np.ndarray,
@@ -151,13 +124,11 @@ def _mser_saturation_candidates(
         aspect = float(w) / max(float(h), 1.0)
         if aspect < 0.6 or aspect > 1.6:
             continue
-        roi_padding = max(padding, round(max(int(w), int(h)) * 0.35))
-        roi = _padded_roi(len(candidates) + 1, int(x), int(y), int(w), int(h), roi_padding, width, height)
+        roi = _padded_roi(len(candidates) + 1, int(x), int(y), int(w), int(h), padding, width, height)
         density = _edge_density(edges, roi)
         module_texture = _module_texture(gray, roi)
         if density < 0.025 or module_texture < 0.015:
             continue
-        finder_score = _finder_pattern_score(gray, roi)
         dark_ratio = _dark_ratio(gray, roi)
         if dark_ratio < 0.05 or dark_ratio > 0.95:
             continue
@@ -173,11 +144,10 @@ def _mser_saturation_candidates(
                 "aspect": aspect,
                 "edge_density": density,
                 "module_texture": module_texture,
-                "finder_score": finder_score,
                 "dark_ratio": dark_ratio,
             },
         )
-        score = area * (density + module_texture * 3.0) * (0.35 + finder_score * 7.0)
+        score = area * (density + module_texture * 3.0)
         candidates.append((score, roi))
     return candidates
 
@@ -199,30 +169,6 @@ def _deduplicate_candidates(candidates: list[tuple[float, Roi]]) -> list[tuple[f
             continue
         deduped.append((score, Roi(id=len(deduped) + 1, x=roi.x, y=roi.y, width=roi.width, height=roi.height, quality=roi.quality)))
     return deduped
-
-
-def _merge_overlapping_candidates(candidates: list[tuple[float, Roi]], image_width: int, image_height: int) -> list[tuple[float, Roi]]:
-    merged: list[tuple[float, Roi]] = []
-    for score, roi in sorted(candidates, key=lambda item: item[0], reverse=True):
-        merged_into_existing = False
-        for index, (existing_score, existing) in enumerate(merged):
-            if _roi_iou(roi, existing) <= 0.35:
-                continue
-            left = max(0, min(roi.x, existing.x))
-            top = max(0, min(roi.y, existing.y))
-            right = min(image_width, max(roi.x + roi.width, existing.x + existing.width))
-            bottom = min(image_height, max(roi.y + roi.height, existing.y + existing.height))
-            quality = dict(existing.quality)
-            quality["merged_candidates"] = int(quality.get("merged_candidates", 1)) + 1
-            merged[index] = (
-                existing_score + score * 0.25,
-                Roi(id=existing.id, x=left, y=top, width=right - left, height=bottom - top, quality=quality),
-            )
-            merged_into_existing = True
-            break
-        if not merged_into_existing:
-            merged.append((score, roi))
-    return merged
 
 
 def _roi_iou(first: Roi, second: Roi) -> float:
