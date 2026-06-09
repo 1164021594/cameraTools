@@ -14,7 +14,7 @@ from PySide6.QtWidgets import QApplication
 import decoder_debugger.main_window as debugger_window_module
 import decoder_debugger.main as debugger_main_module
 from decoder_debugger.main_window import DecoderDebuggerWindow
-from decoder_debugger.preprocess import PreprocessConfig, apply_preprocess, config_from_json, config_to_json
+from decoder_debugger.preprocess import BUILTIN_PREPROCESS_SCENES, PreprocessConfig, apply_preprocess, config_from_json, config_to_json
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -174,6 +174,17 @@ def test_preprocess_config_json_round_trip():
     assert loaded == config
 
 
+def test_builtin_preprocess_scene_matches_early_decoder_adaptive_candidate():
+    config = BUILTIN_PREPROCESS_SCENES["Early decoder - adaptive 3x"]
+
+    assert config.view == "Preprocessed"
+    assert config.channel == "Gray"
+    assert config.threshold_mode == "Adaptive"
+    assert config.adaptive_block_size == 21
+    assert config.adaptive_c == 4
+    assert config.scale_factor == 3.0
+
+
 def test_decoder_debugger_has_preprocess_find_decode_and_logs_tabs():
     app = QApplication.instance() or QApplication([])
     window = DecoderDebuggerWindow()
@@ -184,6 +195,28 @@ def test_decoder_debugger_has_preprocess_find_decode_and_logs_tabs():
     assert tab_names == ["Preprocess", "Find / Decode", "Batch / Logs"]
     assert window.preview_view_mode.currentText() == "Original"
     assert window.find_input_view.currentText() == "Original"
+
+
+def test_selecting_builtin_preprocess_scene_loads_matching_controls(monkeypatch, tmp_path):
+    app = QApplication.instance() or QApplication([])
+    image_path = tmp_path / "sample.bmp"
+    image_path.write_bytes(b"fake")
+    frame = np.zeros((20, 30, 3), dtype=np.uint8)
+    monkeypatch.setattr(debugger_window_module, "read_image_color", lambda path: frame.copy())
+    window = DecoderDebuggerWindow()
+
+    window.load_image_path(image_path)
+    window.preprocess_scene.setCurrentText("Early decoder - adaptive 3x")
+
+    assert app is not None
+    assert window.preview_view_mode.currentText() == "Preprocessed"
+    assert window.channel_select.currentText() == "Gray"
+    assert window.threshold_mode.currentText() == "Adaptive"
+    assert window.adaptive_block_size.value() == 21
+    assert window.adaptive_c.value() == 4
+    assert window.scale_factor.value() == 3.0
+    assert window.image_view._last_frame is not None
+    assert window.image_view._last_frame.shape[:2] == (60, 90)
 
 
 def test_preprocess_controls_update_preprocessed_preview(monkeypatch, tmp_path):

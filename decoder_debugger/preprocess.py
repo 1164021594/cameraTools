@@ -41,6 +41,42 @@ class PreprocessResult:
     config: PreprocessConfig
 
 
+BUILTIN_PREPROCESS_SCENES: dict[str, PreprocessConfig] = {
+    "Early decoder - gray 3x": PreprocessConfig(view="Preprocessed", channel="Gray", scale_factor=3.0),
+    "Early decoder - clahe 3x": PreprocessConfig(
+        view="Preprocessed",
+        channel="Gray",
+        clahe_enabled=True,
+        clahe_clip_limit=2.0,
+        clahe_tile_size=8,
+        scale_factor=3.0,
+    ),
+    "Early decoder - sharpen 3x": PreprocessConfig(
+        view="Preprocessed",
+        channel="Gray",
+        sharpen_enabled=True,
+        sharpen_strength=1.6,
+        sharpen_radius=1.0,
+        scale_factor=3.0,
+    ),
+    "Early decoder - otsu 3x": PreprocessConfig(
+        view="Preprocessed",
+        channel="Gray",
+        threshold_mode="Otsu",
+        scale_factor=3.0,
+    ),
+    "Early decoder - adaptive 3x": PreprocessConfig(
+        view="Preprocessed",
+        channel="Gray",
+        threshold_mode="Adaptive",
+        adaptive_block_size=21,
+        adaptive_c=4,
+        scale_factor=3.0,
+    ),
+    "ROI finder - saturation source": PreprocessConfig(view="Preprocessed", channel="HSV Saturation"),
+}
+
+
 def apply_preprocess(image: np.ndarray, config: PreprocessConfig) -> PreprocessResult:
     stages: dict[str, np.ndarray] = {"Original": image.copy()}
     timings: dict[str, float] = {}

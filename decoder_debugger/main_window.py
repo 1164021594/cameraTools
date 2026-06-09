@@ -34,6 +34,7 @@ from stereo_aruco_gui.app.image_view import ImageView
 from decoder_debugger.image_io import list_image_files, read_image_color
 from decoder_debugger.overlay import draw_debug_overlay
 from decoder_debugger.preprocess import (
+    BUILTIN_PREPROCESS_SCENES,
     PreprocessConfig,
     PreprocessResult,
     apply_preprocess,
@@ -55,6 +56,7 @@ class DecoderDebuggerWindow(QMainWindow):
         self.preprocess_config = PreprocessConfig()
         self.preprocess_result: PreprocessResult | None = None
         self.selected_roi_id: int | None = None
+        self._applying_preprocess_scene = False
         self._build_ui()
 
     def _build_ui(self) -> None:
@@ -73,6 +75,9 @@ class DecoderDebuggerWindow(QMainWindow):
         open_image.clicked.connect(self.open_image)
         open_folder = QPushButton("Open Folder")
         open_folder.clicked.connect(self.open_folder)
+        self.preprocess_scene = QComboBox()
+        self.preprocess_scene.addItems(("Manual", *BUILTIN_PREPROCESS_SCENES.keys()))
+        self.preprocess_scene.currentTextChanged.connect(self._preprocess_scene_changed)
         self.preview_view_mode = QComboBox()
         self.preview_view_mode.addItems(("Original", "Preprocessed"))
         self.preview_view_mode.currentTextChanged.connect(lambda _text: self._preprocess_controls_changed())
@@ -80,6 +85,8 @@ class DecoderDebuggerWindow(QMainWindow):
         self.path_label.setWordWrap(True)
         controls.addWidget(open_image)
         controls.addWidget(open_folder)
+        controls.addWidget(QLabel("Scene"))
+        controls.addWidget(self.preprocess_scene)
         controls.addWidget(QLabel("Preview View"))
         controls.addWidget(self.preview_view_mode)
         operator_scroll = QScrollArea()
@@ -249,6 +256,10 @@ class DecoderDebuggerWindow(QMainWindow):
         return inspector
 
     def _preprocess_controls_changed(self) -> None:
+        if not self._applying_preprocess_scene:
+            self.preprocess_scene.blockSignals(True)
+            self.preprocess_scene.setCurrentText("Manual")
+            self.preprocess_scene.blockSignals(False)
         self.preprocess_config = PreprocessConfig(
             view=self.preview_view_mode.currentText(),
             channel=self.channel_select.currentText(),
@@ -272,6 +283,40 @@ class DecoderDebuggerWindow(QMainWindow):
             quiet_zone_padding=self.quiet_zone_padding.value(),
         )
         self._refresh_preprocess_preview()
+
+    def _preprocess_scene_changed(self, name: str) -> None:
+        config = BUILTIN_PREPROCESS_SCENES.get(name)
+        if config is None:
+            return
+        self._set_preprocess_controls(config, keep_scene=True)
+
+    def _set_preprocess_controls(self, config: PreprocessConfig, keep_scene: bool = False) -> None:
+        self._applying_preprocess_scene = keep_scene
+        try:
+            self.preprocess_config = config
+            self.preview_view_mode.setCurrentText(config.view)
+            self.channel_select.setCurrentText(config.channel)
+            self.clahe_enabled.setChecked(config.clahe_enabled)
+            self.clahe_clip_limit.setValue(config.clahe_clip_limit)
+            self.clahe_tile_size.setValue(config.clahe_tile_size)
+            self.blur_mode.setCurrentText(config.blur_mode)
+            self.blur_kernel.setValue(config.blur_kernel)
+            self.sharpen_enabled.setChecked(config.sharpen_enabled)
+            self.sharpen_strength.setValue(config.sharpen_strength)
+            self.sharpen_radius.setValue(config.sharpen_radius)
+            self.threshold_mode.setCurrentText(config.threshold_mode)
+            self.adaptive_block_size.setValue(config.adaptive_block_size)
+            self.adaptive_c.setValue(config.adaptive_c)
+            self.manual_threshold.setValue(config.manual_threshold)
+            self.threshold_invert.setChecked(config.threshold_invert)
+            self.morphology.setCurrentText(config.morphology)
+            self.morphology_kernel.setValue(config.morphology_kernel)
+            self.morphology_iterations.setValue(config.morphology_iterations)
+            self.scale_factor.setValue(config.scale_factor)
+            self.quiet_zone_padding.setValue(config.quiet_zone_padding)
+            self._preprocess_controls_changed()
+        finally:
+            self._applying_preprocess_scene = False
 
     def _refresh_preprocess_preview(self) -> None:
         if self.current_image is None:
@@ -339,28 +384,7 @@ class DecoderDebuggerWindow(QMainWindow):
 
     def load_preprocess_preset(self, path: str | Path) -> None:
         config = config_from_json(Path(path).read_text(encoding="utf-8"))
-        self.preprocess_config = config
-        self.preview_view_mode.setCurrentText(config.view)
-        self.channel_select.setCurrentText(config.channel)
-        self.clahe_enabled.setChecked(config.clahe_enabled)
-        self.clahe_clip_limit.setValue(config.clahe_clip_limit)
-        self.clahe_tile_size.setValue(config.clahe_tile_size)
-        self.blur_mode.setCurrentText(config.blur_mode)
-        self.blur_kernel.setValue(config.blur_kernel)
-        self.sharpen_enabled.setChecked(config.sharpen_enabled)
-        self.sharpen_strength.setValue(config.sharpen_strength)
-        self.sharpen_radius.setValue(config.sharpen_radius)
-        self.threshold_mode.setCurrentText(config.threshold_mode)
-        self.adaptive_block_size.setValue(config.adaptive_block_size)
-        self.adaptive_c.setValue(config.adaptive_c)
-        self.manual_threshold.setValue(config.manual_threshold)
-        self.threshold_invert.setChecked(config.threshold_invert)
-        self.morphology.setCurrentText(config.morphology)
-        self.morphology_kernel.setValue(config.morphology_kernel)
-        self.morphology_iterations.setValue(config.morphology_iterations)
-        self.scale_factor.setValue(config.scale_factor)
-        self.quiet_zone_padding.setValue(config.quiet_zone_padding)
-        self._refresh_preprocess_preview()
+        self._set_preprocess_controls(config)
 
     def _save_preprocess_preset_dialog(self) -> None:
         path, _ = QFileDialog.getSaveFileName(self, "Save Preprocess Preset", "", "JSON (*.json)")
