@@ -172,3 +172,15 @@ def test_preprocess_config_json_round_trip():
     loaded = config_from_json(config_to_json(config))
 
     assert loaded == config
+
+
+def test_decoder_debugger_has_preprocess_find_decode_and_logs_tabs():
+    app = QApplication.instance() or QApplication([])
+    window = DecoderDebuggerWindow()
+
+    tab_names = [window.tabs.tabText(index) for index in range(window.tabs.count())]
+
+    assert app is not None
+    assert tab_names == ["Preprocess", "Find / Decode", "Batch / Logs"]
+    assert window.preview_view_mode.currentText() == "Original"
+    assert window.find_input_view.currentText() == "Original"

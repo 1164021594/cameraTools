@@ -3,14 +3,20 @@ from __future__ import annotations
 from pathlib import Path
 from time import perf_counter
 
+import cv2
 import numpy as np
 from PySide6.QtWidgets import (
+    QComboBox,
     QFileDialog,
+    QFormLayout,
+    QGroupBox,
     QHBoxLayout,
     QLabel,
     QMainWindow,
     QMessageBox,
     QPushButton,
+    QSpinBox,
+    QTabWidget,
     QTextEdit,
     QVBoxLayout,
     QWidget,
@@ -24,6 +30,7 @@ from stereo_aruco_gui.app.image_view import ImageView
 
 from decoder_debugger.image_io import list_image_files, read_image_color
 from decoder_debugger.overlay import draw_debug_overlay
+from decoder_debugger.preprocess import PreprocessConfig, PreprocessResult, apply_preprocess
 
 
 class DecoderDebuggerWindow(QMainWindow):
@@ -36,9 +43,19 @@ class DecoderDebuggerWindow(QMainWindow):
         self.current_folder_images: list[Path] = []
         self.current_rois: tuple[Roi, ...] = ()
         self.current_results: list[CodeResult] = []
+        self.preprocess_config = PreprocessConfig()
+        self.preprocess_result: PreprocessResult | None = None
+        self.selected_roi_id: int | None = None
         self._build_ui()
 
     def _build_ui(self) -> None:
+        self.tabs = QTabWidget()
+        self.tabs.addTab(self._preprocess_tab(), "Preprocess")
+        self.tabs.addTab(self._find_decode_tab(), "Find / Decode")
+        self.tabs.addTab(self._logs_tab(), "Batch / Logs")
+        self.setCentralWidget(self.tabs)
+
+    def _preprocess_tab(self) -> QWidget:
         root = QWidget()
         layout = QHBoxLayout(root)
 
@@ -47,19 +64,86 @@ class DecoderDebuggerWindow(QMainWindow):
         open_image.clicked.connect(self.open_image)
         open_folder = QPushButton("Open Folder")
         open_folder.clicked.connect(self.open_folder)
-        run_button = QPushButton("Run Decode")
-        run_button.clicked.connect(self.run_decode)
+        self.preview_view_mode = QComboBox()
+        self.preview_view_mode.addItems(("Original", "Preprocessed"))
+        self.preview_view_mode.currentTextChanged.connect(lambda _text: self._refresh_preprocess_preview())
         self.path_label = QLabel("No image loaded")
         self.path_label.setWordWrap(True)
         controls.addWidget(open_image)
         controls.addWidget(open_folder)
-        controls.addWidget(run_button)
+        controls.addWidget(QLabel("Preview View"))
+        controls.addWidget(self.preview_view_mode)
+        controls.addWidget(self._operator_group())
         controls.addWidget(self.path_label)
         controls.addStretch(1)
 
-        self.image_view = ImageView("Decoder image")
+        self.image_view = ImageView("Preprocess preview")
         self.image_view.set_zoom_enabled(True)
 
+        layout.addLayout(controls, stretch=0)
+        layout.addWidget(self.image_view, stretch=1)
+        return root
+
+    def _operator_group(self) -> QGroupBox:
+        group = QGroupBox("Preprocess Operators")
+        form = QFormLayout(group)
+        self.channel_select = QComboBox()
+        self.channel_select.addItems(("Original", "Gray", "B", "G", "R", "HSV Saturation", "HSV Value"))
+        self.channel_select.currentTextChanged.connect(lambda _text: self._preprocess_controls_changed())
+        self.threshold_mode = QComboBox()
+        self.threshold_mode.addItems(("None", "Otsu", "Adaptive", "Manual"))
+        self.threshold_mode.currentTextChanged.connect(lambda _text: self._preprocess_controls_changed())
+        self.manual_threshold = QSpinBox()
+        self.manual_threshold.setRange(0, 255)
+        self.manual_threshold.setValue(128)
+        self.manual_threshold.valueChanged.connect(lambda _value: self._preprocess_controls_changed())
+        form.addRow("Channel", self.channel_select)
+        form.addRow("Threshold", self.threshold_mode)
+        form.addRow("Manual value", self.manual_threshold)
+        return group
+
+    def _find_decode_tab(self) -> QWidget:
+        root = QWidget()
+        layout = QHBoxLayout(root)
+        controls = QVBoxLayout()
+        self.find_input_view = QComboBox()
+        self.find_input_view.addItems(("Original", "Preprocessed"))
+        find_button = QPushButton("Find Code")
+        find_button.clicked.connect(self.find_code)
+        decode_button = QPushButton("Decode Selected ROI")
+        decode_button.clicked.connect(self.decode_selected_roi)
+        self.find_decode_view = ImageView("Find / Decode")
+        self.find_decode_view.set_zoom_enabled(True)
+        self.timing_label = QLabel("Timing: --")
+        self.find_decode_result_box = QTextEdit()
+        self.find_decode_result_box.setReadOnly(True)
+        self.result_box = self.find_decode_result_box
+        controls.addWidget(QLabel("Input View"))
+        controls.addWidget(self.find_input_view)
+        controls.addWidget(find_button)
+        controls.addWidget(decode_button)
+        controls.addStretch(1)
+        layout.addLayout(controls, stretch=0)
+        layout.addWidget(self.find_decode_view, stretch=1)
+        inspector = QVBoxLayout()
+        inspector.addWidget(QLabel("Decode Inspector"))
+        inspector.addWidget(self.timing_label)
+        inspector.addWidget(self.find_decode_result_box, stretch=1)
+        inspector_widget = QWidget()
+        inspector_widget.setLayout(inspector)
+        layout.addWidget(inspector_widget, stretch=0)
+        return root
+
+    def _logs_tab(self) -> QWidget:
+        root = QWidget()
+        layout = QVBoxLayout(root)
+        self.batch_log_box = QTextEdit()
+        self.batch_log_box.setReadOnly(True)
+        self.batch_log_box.setPlainText("Batch / Logs")
+        layout.addWidget(self.batch_log_box)
+        return root
+
+    def _legacy_inspector_layout(self) -> QVBoxLayout:
         inspector = QVBoxLayout()
         self.timing_label = QLabel("Timing: --")
         self.result_box = QTextEdit()
@@ -67,11 +151,19 @@ class DecoderDebuggerWindow(QMainWindow):
         inspector.addWidget(QLabel("Decode Inspector"))
         inspector.addWidget(self.timing_label)
         inspector.addWidget(self.result_box, stretch=1)
+        return inspector
 
-        layout.addLayout(controls, stretch=0)
-        layout.addWidget(self.image_view, stretch=1)
-        layout.addLayout(inspector, stretch=0)
-        self.setCentralWidget(root)
+    def _preprocess_controls_changed(self) -> None:
+        return
+
+    def _refresh_preprocess_preview(self) -> None:
+        return
+
+    def find_code(self) -> None:
+        self.find_decode_result_box.setPlainText("Find Code is not implemented yet.")
+
+    def decode_selected_roi(self) -> None:
+        self.find_decode_result_box.setPlainText("Decode Selected ROI is not implemented yet.")
 
     def open_image(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
