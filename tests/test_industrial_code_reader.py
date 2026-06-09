@@ -177,6 +177,37 @@ def test_datamatrix_roi_generator_prioritizes_internal_module_texture_over_blank
     assert best.quality["module_texture"] > 0.10
 
 
+def test_datamatrix_roi_generator_prioritizes_l_finder_pattern_over_chip_like_texture():
+    cv2 = __import__("cv2")
+    image = np.full((180, 260, 3), 255, dtype=np.uint8)
+    image[:, :] = (0, 120, 90)
+
+    cv2.rectangle(image, (45, 55), (88, 98), (95, 75, 25), -1)
+    for offset in range(0, 44, 6):
+        cv2.line(image, (45 + offset, 55), (45 + offset, 98), (170, 150, 50), 1)
+        cv2.line(image, (45, 55 + offset), (88, 55 + offset), (170, 150, 50), 1)
+
+    x0, y0, cell = 150, 60, 5
+    for row in range(12):
+        for col in range(12):
+            is_l_finder = row == 11 or col == 0
+            is_clock = (row == 0 and col % 2 == 0) or (col == 11 and row % 2 == 0)
+            is_data = (row * 3 + col * 5) % 7 in {0, 2, 3}
+            light = not (is_l_finder or is_clock or is_data)
+            color = (225, 225, 225) if light else (0, 80, 55)
+            image[y0 + row * cell : y0 + (row + 1) * cell, x0 + col * cell : x0 + (col + 1) * cell] = color
+
+    rois = DataMatrixRoiGenerator(min_area=80, padding=4).generate(image)
+
+    assert rois
+    best = rois[0]
+    assert best.x <= x0
+    assert best.y <= y0
+    assert best.x + best.width >= x0 + 12 * cell
+    assert best.y + best.height >= y0 + 12 * cell
+    assert best.quality["finder_score"] > 0.25
+
+
 def test_datamatrix_roi_generator_finds_colored_pcb_code_connected_to_large_board_edge():
     cv2 = __import__("cv2")
     image = np.full((180, 260, 3), 255, dtype=np.uint8)
