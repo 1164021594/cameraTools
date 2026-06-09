@@ -210,6 +210,8 @@ class DecoderDebuggerWindow(QMainWindow):
         controls = QVBoxLayout()
         self.find_input_view = QComboBox()
         self.find_input_view.addItems(("Original", "Preprocessed"))
+        self.decoder_method = QComboBox()
+        self.decoder_method.addItems(("Auto", "Native", "ZXing"))
         find_button = QPushButton("Find Code")
         find_button.clicked.connect(self.find_code)
         decode_all_button = QPushButton("Decode All Candidate ROIs")
@@ -224,6 +226,8 @@ class DecoderDebuggerWindow(QMainWindow):
         self.result_box = self.find_decode_result_box
         controls.addWidget(QLabel("Input View"))
         controls.addWidget(self.find_input_view)
+        controls.addWidget(QLabel("Decoder Method"))
+        controls.addWidget(self.decoder_method)
         controls.addWidget(find_button)
         controls.addWidget(decode_all_button)
         controls.addWidget(decode_button)
@@ -363,7 +367,7 @@ class DecoderDebuggerWindow(QMainWindow):
             return
         selected = self._selected_roi()
         start = perf_counter()
-        engine = CodeReaderEngine([DataMatrixDecoder()])
+        engine = CodeReaderEngine([DataMatrixDecoder(method=self._decoder_method())])
         self.current_results = engine.decode(
             image,
             DecodeOptions(rois=(selected,), max_results=16, max_rois=16, return_failures=True),
@@ -383,7 +387,7 @@ class DecoderDebuggerWindow(QMainWindow):
             self.find_decode_result_box.setPlainText("Run Find Code first.")
             return
         start = perf_counter()
-        engine = CodeReaderEngine([DataMatrixDecoder()])
+        engine = CodeReaderEngine([DataMatrixDecoder(method=self._decoder_method())])
         self.current_results = engine.decode(
             image,
             DecodeOptions(rois=self.current_rois, max_results=16, max_rois=len(self.current_rois), return_failures=True),
@@ -400,6 +404,9 @@ class DecoderDebuggerWindow(QMainWindow):
                 if roi.id == self.selected_roi_id:
                     return roi
         return self.current_rois[0]
+
+    def _decoder_method(self) -> str:
+        return self.decoder_method.currentText().lower()
 
     def save_preprocess_preset(self, path: str | Path) -> None:
         self._preprocess_controls_changed()

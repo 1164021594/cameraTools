@@ -6,6 +6,7 @@ import numpy as np
 
 from industrial_code_reader.core.preprocess import PreprocessedImage, datamatrix_preprocess_bank
 from industrial_code_reader.core.types import CodeResult, DecodeOptions
+from industrial_code_reader.datamatrix.native import NativeDataMatrixDecoder
 
 
 def require_zxingcpp() -> Any:
@@ -19,7 +20,23 @@ def require_zxingcpp() -> Any:
 class DataMatrixDecoder:
     symbology = "DataMatrix"
 
+    def __init__(self, method: str = "auto") -> None:
+        normalized = method.lower().strip()
+        if normalized not in {"auto", "native", "zxing"}:
+            raise ValueError(f"Unsupported DataMatrix decoder method: {method}")
+        self.method = normalized
+
     def decode(self, image: np.ndarray, options: DecodeOptions) -> list[CodeResult]:
+        if self.method == "native":
+            return NativeDataMatrixDecoder().decode(image, options)
+        if self.method == "auto":
+            native_results = NativeDataMatrixDecoder().decode(image, DecodeOptions(**{**options.__dict__, "return_failures": False}))
+            if native_results:
+                return native_results
+            return self._decode_zxing(image, options)
+        return self._decode_zxing(image, options)
+
+    def _decode_zxing(self, image: np.ndarray, options: DecodeOptions) -> list[CodeResult]:
         zxingcpp = require_zxingcpp()
         formats = (zxingcpp.BarcodeFormat.DataMatrix,)
         variants = datamatrix_preprocess_bank(image) if options.enable_preprocessing else [PreprocessedImage("original", image, 1.0)]

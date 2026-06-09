@@ -195,6 +195,7 @@ def test_decoder_debugger_has_preprocess_find_decode_and_logs_tabs():
     assert tab_names == ["Preprocess", "Find / Decode", "Batch / Logs"]
     assert window.preview_view_mode.currentText() == "Original"
     assert window.find_input_view.currentText() == "Original"
+    assert window.decoder_method.currentText() == "Auto"
 
 
 def test_selecting_builtin_preprocess_scene_loads_matching_controls(monkeypatch, tmp_path):
@@ -358,6 +359,39 @@ def test_decode_all_rois_decodes_every_candidate_roi(monkeypatch, tmp_path):
     assert captured["rois"] == rois
     assert "Decoded Text:" in window.find_decode_result_box.toPlainText()
     assert "ROI2" in window.find_decode_result_box.toPlainText()
+
+
+def test_decode_all_rois_passes_selected_decoder_method(monkeypatch, tmp_path):
+    app = QApplication.instance() or QApplication([])
+    image_path = tmp_path / "sample.bmp"
+    image_path.write_bytes(b"fake")
+    frame = np.zeros((40, 50, 3), dtype=np.uint8)
+    rois = (Roi(id=1, x=5, y=6, width=10, height=10),)
+    captured = {}
+    monkeypatch.setattr(debugger_window_module, "read_image_color", lambda path: frame.copy())
+
+    class FakeDecoder:
+        def __init__(self, method="auto"):  # noqa: ANN001
+            captured["method"] = method
+
+    class FakeEngine:
+        def __init__(self, decoders):  # noqa: ANN001
+            pass
+
+        def decode(self, image, options):  # noqa: ANN001
+            return [CodeResult(text="NATIVE", symbology="DataMatrix", roi_id=1, bbox=(5, 6, 10, 10), preprocessing="fake")]
+
+    monkeypatch.setattr(debugger_window_module, "DataMatrixDecoder", FakeDecoder)
+    monkeypatch.setattr(debugger_window_module, "CodeReaderEngine", FakeEngine)
+    window = DecoderDebuggerWindow()
+    window.load_image_path(image_path)
+    window.current_rois = rois
+    window.decoder_method.setCurrentText("Native")
+
+    window.decode_all_rois()
+
+    assert app is not None
+    assert captured["method"] == "native"
 
 
 def test_decode_result_panel_shows_decoded_text_prominently(monkeypatch, tmp_path):

@@ -78,6 +78,42 @@ def test_datamatrix_decoder_maps_zxing_position_to_points(monkeypatch):
     assert results[0].quality["backend"] == "zxing-cpp"
 
 
+def test_datamatrix_decoder_native_method_does_not_call_zxing(monkeypatch):
+    def fail_require_zxing():  # noqa: ANN001
+        raise AssertionError("native decoder should not call zxing")
+
+    monkeypatch.setattr(dm_decoder_module, "require_zxingcpp", fail_require_zxing)
+
+    results = DataMatrixDecoder(method="native").decode(np.zeros((20, 20, 3), dtype=np.uint8), DecodeOptions(return_failures=True))
+
+    assert results
+    assert results[0].failure_reason == "Native DataMatrix decoder is not complete yet"
+    assert results[0].quality["backend"] == "native"
+
+
+def test_datamatrix_decoder_auto_falls_back_to_zxing_when_native_finds_nothing(monkeypatch):
+    class FakeBarcode:
+        valid = True
+        text = "ZXING-FALLBACK"
+        format = "DataMatrix"
+        position = None
+
+    class FakeZxing:
+        class BarcodeFormat:
+            DataMatrix = "DataMatrix"
+
+        @staticmethod
+        def read_barcodes(image, formats=None):  # noqa: ANN001
+            return [FakeBarcode()] if image.shape[0] > 30 else []
+
+    monkeypatch.setattr(dm_decoder_module, "require_zxingcpp", lambda: FakeZxing)
+
+    results = DataMatrixDecoder(method="auto").decode(np.zeros((12, 12, 3), dtype=np.uint8), DecodeOptions())
+
+    assert results[0].text == "ZXING-FALLBACK"
+    assert results[0].quality["backend"] == "zxing-cpp"
+
+
 def test_engine_decodes_supplied_rois_and_offsets_result_coordinates(monkeypatch):
     decoded_shapes: list[tuple[int, int, int]] = []
 
