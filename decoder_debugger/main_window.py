@@ -181,10 +181,46 @@ class DecoderDebuggerWindow(QMainWindow):
         return self.current_image
 
     def find_code(self) -> None:
-        self.find_decode_result_box.setPlainText("Find Code is not implemented yet.")
+        image = self._selected_input_image()
+        if image is None:
+            self.find_decode_result_box.setPlainText("Load an image first.")
+            return
+        start = perf_counter()
+        self.current_rois = DataMatrixRoiGenerator(max_rois=32).generate(image)
+        self.selected_roi_id = self.current_rois[0].id if self.current_rois else None
+        overlay = draw_debug_overlay(image, self.current_rois, [], selected_roi_id=self.selected_roi_id)
+        self.find_decode_view.set_frame(overlay)
+        elapsed_ms = (perf_counter() - start) * 1000.0
+        self.timing_label.setText(f"Find Code: {elapsed_ms:.1f} ms")
+        self.find_decode_result_box.setPlainText(f"Candidates: {len(self.current_rois)}\nFind Code: {elapsed_ms:.1f} ms")
 
     def decode_selected_roi(self) -> None:
-        self.find_decode_result_box.setPlainText("Decode Selected ROI is not implemented yet.")
+        image = self._selected_input_image()
+        if image is None:
+            self.find_decode_result_box.setPlainText("Load an image first.")
+            return
+        if not self.current_rois:
+            self.find_decode_result_box.setPlainText("Run Find Code first.")
+            return
+        selected = self._selected_roi()
+        start = perf_counter()
+        engine = CodeReaderEngine([DataMatrixDecoder()])
+        self.current_results = engine.decode(
+            image,
+            DecodeOptions(rois=(selected,), max_results=16, max_rois=16, return_failures=True),
+        )
+        elapsed_ms = (perf_counter() - start) * 1000.0
+        overlay = draw_debug_overlay(image, self.current_rois, self.current_results, selected_roi_id=selected.id)
+        self.find_decode_view.set_frame(overlay)
+        self.timing_label.setText(f"Total {elapsed_ms:.1f} ms | Decode Selected ROI {elapsed_ms:.1f} ms")
+        self.find_decode_result_box.setPlainText(self._result_text() + f"\nDecode Selected ROI: {elapsed_ms:.1f} ms")
+
+    def _selected_roi(self) -> Roi:
+        if self.selected_roi_id is not None:
+            for roi in self.current_rois:
+                if roi.id == self.selected_roi_id:
+                    return roi
+        return self.current_rois[0]
 
     def open_image(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
@@ -222,27 +258,8 @@ class DecoderDebuggerWindow(QMainWindow):
         self.find_decode_view.set_frame(image)
 
     def run_decode(self) -> None:
-        if self.current_image is None:
-            self.result_box.setPlainText("Load an image first.")
-            return
-        start = perf_counter()
-        roi_start = perf_counter()
-        self.current_rois = DataMatrixRoiGenerator(max_rois=32).generate(self.current_image)
-        roi_elapsed_ms = (perf_counter() - roi_start) * 1000.0
-        decode_start = perf_counter()
-        engine = CodeReaderEngine([DataMatrixDecoder()])
-        self.current_results = engine.decode(
-            self.current_image,
-            DecodeOptions(rois=self.current_rois[:16], max_results=16, max_rois=16, return_failures=True),
-        )
-        decode_elapsed_ms = (perf_counter() - decode_start) * 1000.0
-        total_elapsed_ms = (perf_counter() - start) * 1000.0
-        overlay = draw_debug_overlay(self.current_image, self.current_rois, self.current_results)
-        self.image_view.set_frame(overlay)
-        self.timing_label.setText(
-            f"Total {total_elapsed_ms:.1f} ms | ROI {roi_elapsed_ms:.1f} ms | Decode {decode_elapsed_ms:.1f} ms"
-        )
-        self.result_box.setPlainText(self._result_text())
+        self.find_code()
+        self.decode_selected_roi()
 
     def _result_text(self) -> str:
         lines = [f"Candidates: {len(self.current_rois)}", f"Results: {len(self.current_results)}"]

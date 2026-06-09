@@ -207,3 +207,68 @@ def test_preprocess_controls_update_preprocessed_preview(monkeypatch, tmp_path):
     assert window.image_view._last_frame.shape[:2] == (20, 30)
     assert int(window.image_view._last_frame[0, 0, 0]) == 0
     assert int(window.image_view._last_frame[0, 20, 0]) == 255
+
+
+def test_find_code_uses_preprocessed_input_when_selected(monkeypatch, tmp_path):
+    app = QApplication.instance() or QApplication([])
+    image_path = tmp_path / "sample.bmp"
+    image_path.write_bytes(b"fake")
+    frame = np.zeros((20, 30, 3), dtype=np.uint8)
+    frame[:, 15:] = 220
+    captured = {}
+    rois = (Roi(id=1, x=2, y=3, width=10, height=10),)
+    monkeypatch.setattr(debugger_window_module, "read_image_color", lambda path: frame.copy())
+
+    def fake_generate(self, image):  # noqa: ANN001
+        captured["shape"] = image.shape
+        captured["right_pixel"] = int(image[0, 20, 0])
+        return rois
+
+    monkeypatch.setattr(debugger_window_module.DataMatrixRoiGenerator, "generate", fake_generate)
+    window = DecoderDebuggerWindow()
+    window.load_image_path(image_path)
+    window.channel_select.setCurrentText("Gray")
+    window.threshold_mode.setCurrentText("Manual")
+    window.manual_threshold.setValue(100)
+    window.find_input_view.setCurrentText("Preprocessed")
+
+    window.find_code()
+
+    assert app is not None
+    assert captured == {"shape": (20, 30, 3), "right_pixel": 255}
+    assert window.current_rois == rois
+    assert "Candidates: 1" in window.find_decode_result_box.toPlainText()
+
+
+def test_decode_selected_roi_decodes_only_selected_roi(monkeypatch, tmp_path):
+    app = QApplication.instance() or QApplication([])
+    image_path = tmp_path / "sample.bmp"
+    image_path.write_bytes(b"fake")
+    frame = np.zeros((40, 50, 3), dtype=np.uint8)
+    rois = (
+        Roi(id=1, x=5, y=6, width=10, height=10),
+        Roi(id=2, x=20, y=10, width=12, height=12),
+    )
+    results = [CodeResult(text="ROI2", symbology="DataMatrix", roi_id=2, bbox=(20, 10, 12, 12), preprocessing="fake")]
+    captured = {}
+    monkeypatch.setattr(debugger_window_module, "read_image_color", lambda path: frame.copy())
+
+    class FakeEngine:
+        def __init__(self, decoders):  # noqa: ANN001
+            pass
+
+        def decode(self, image, options):  # noqa: ANN001
+            captured["rois"] = options.rois
+            return results
+
+    monkeypatch.setattr(debugger_window_module, "CodeReaderEngine", FakeEngine)
+    window = DecoderDebuggerWindow()
+    window.load_image_path(image_path)
+    window.current_rois = rois
+    window.selected_roi_id = 2
+
+    window.decode_selected_roi()
+
+    assert app is not None
+    assert captured["rois"] == (rois[1],)
+    assert "ROI2" in window.find_decode_result_box.toPlainText()
