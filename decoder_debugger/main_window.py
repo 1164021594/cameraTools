@@ -154,10 +154,31 @@ class DecoderDebuggerWindow(QMainWindow):
         return inspector
 
     def _preprocess_controls_changed(self) -> None:
-        return
+        self.preprocess_config = PreprocessConfig(
+            view=self.preview_view_mode.currentText(),
+            channel=self.channel_select.currentText(),
+            threshold_mode=self.threshold_mode.currentText(),
+            manual_threshold=self.manual_threshold.value(),
+        )
+        self._refresh_preprocess_preview()
 
     def _refresh_preprocess_preview(self) -> None:
-        return
+        if self.current_image is None:
+            return
+        self.preprocess_result = apply_preprocess(self.current_image, self.preprocess_config)
+        if self.preview_view_mode.currentText() == "Preprocessed":
+            self.image_view.set_frame(_displayable_image(self.preprocess_result.output))
+        else:
+            self.image_view.set_frame(self.current_image)
+
+    def _selected_input_image(self) -> np.ndarray | None:
+        if self.current_image is None:
+            return None
+        if self.find_input_view.currentText() == "Preprocessed":
+            if self.preprocess_result is None:
+                self.preprocess_result = apply_preprocess(self.current_image, self.preprocess_config)
+            return _displayable_image(self.preprocess_result.output)
+        return self.current_image
 
     def find_code(self) -> None:
         self.find_decode_result_box.setPlainText("Find Code is not implemented yet.")
@@ -197,6 +218,8 @@ class DecoderDebuggerWindow(QMainWindow):
         self.result_box.setPlainText("Image loaded. Click Run Decode.")
         self.timing_label.setText("Timing: --")
         self.image_view.set_frame(image)
+        self.preprocess_result = apply_preprocess(image, self.preprocess_config)
+        self.find_decode_view.set_frame(image)
 
     def run_decode(self) -> None:
         if self.current_image is None:
@@ -229,3 +252,9 @@ class DecoderDebuggerWindow(QMainWindow):
             else:
                 lines.append(f"ROI {result.roi_id}: {result.text} ({result.symbology}, {result.preprocessing})")
         return "\n".join(lines)
+
+
+def _displayable_image(image: np.ndarray) -> np.ndarray:
+    if image.ndim == 2:
+        return cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
+    return image

@@ -184,3 +184,26 @@ def test_decoder_debugger_has_preprocess_find_decode_and_logs_tabs():
     assert tab_names == ["Preprocess", "Find / Decode", "Batch / Logs"]
     assert window.preview_view_mode.currentText() == "Original"
     assert window.find_input_view.currentText() == "Original"
+
+
+def test_preprocess_controls_update_preprocessed_preview(monkeypatch, tmp_path):
+    app = QApplication.instance() or QApplication([])
+    image_path = tmp_path / "sample.bmp"
+    image_path.write_bytes(b"fake")
+    frame = np.zeros((20, 30, 3), dtype=np.uint8)
+    frame[:, 15:] = 220
+    monkeypatch.setattr(debugger_window_module, "read_image_color", lambda path: frame.copy())
+    window = DecoderDebuggerWindow()
+
+    window.load_image_path(image_path)
+    window.preview_view_mode.setCurrentText("Preprocessed")
+    window.channel_select.setCurrentText("Gray")
+    window.threshold_mode.setCurrentText("Manual")
+    window.manual_threshold.setValue(100)
+
+    assert app is not None
+    assert window.preprocess_result is not None
+    assert window.image_view._last_frame is not None
+    assert window.image_view._last_frame.shape[:2] == (20, 30)
+    assert int(window.image_view._last_frame[0, 0, 0]) == 0
+    assert int(window.image_view._last_frame[0, 20, 0]) == 255
