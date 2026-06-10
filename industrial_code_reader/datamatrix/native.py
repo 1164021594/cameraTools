@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from itertools import combinations
 from dataclasses import dataclass
 
 import cv2
@@ -10,6 +11,19 @@ from industrial_code_reader.core.types import CodeResult, DecodeOptions
 
 
 _SQUARE_SINGLE_REGION_SIZES = (10, 12, 14, 16, 18, 20, 22, 24, 26)
+_SYMBOL_CODEWORDS = {
+    10: (3, 5),
+    12: (5, 7),
+    14: (8, 10),
+    16: (12, 12),
+    18: (18, 14),
+    20: (22, 18),
+    22: (30, 20),
+    24: (36, 24),
+    26: (44, 28),
+}
+_RS_PRIMITIVE_POLY = 0x12D
+_RS_GENERATOR_BASE = 1
 
 
 @dataclass(frozen=True)
@@ -33,7 +47,12 @@ class NativeDataMatrixDecoder:
             if not codewords:
                 failures.append(f"{binary_name}: no codewords")
                 continue
-            text = _decode_ascii_payload(codewords)
+            corrected = _correct_codewords(sampled.symbol_size, codewords)
+            if corrected is None:
+                failures.append(f"{binary_name}: reed-solomon correction failed")
+                continue
+            data_codewords, errors_corrected, ecc_codewords = corrected
+            text = _decode_ascii_payload(data_codewords)
             if not text:
                 failures.append(f"{binary_name}: payload decode failed")
                 continue
@@ -45,7 +64,14 @@ class NativeDataMatrixDecoder:
                     bbox=sampled.bbox,
                     points=_points_from_bbox(sampled.bbox),
                     confidence=0.55,
-                    quality={"backend": "native", "symbol_size": sampled.symbol_size, "codewords": len(codewords)},
+                    quality={
+                        "backend": "native",
+                        "symbol_size": sampled.symbol_size,
+                        "codewords": len(codewords),
+                        "data_codewords": len(data_codewords),
+                        "ecc_codewords": ecc_codewords,
+                        "errors_corrected": errors_corrected,
+                    },
                     preprocessing=binary_name,
                 )
             ]
@@ -62,6 +88,24 @@ class NativeDataMatrixDecoder:
                 failure_reason="Native DataMatrix decoder is not complete yet",
             )
         ]
+
+
+def _build_gf_tables() -> tuple[list[int], list[int]]:
+    exp = [0] * 512
+    log = [0] * 256
+    value = 1
+    for index in range(255):
+        exp[index] = value
+        log[value] = index
+        value <<= 1
+        if value & 0x100:
+            value ^= _RS_PRIMITIVE_POLY
+    for index in range(255, 512):
+        exp[index] = exp[index - 255]
+    return exp, log
+
+
+_GF_EXP, _GF_LOG = _build_gf_tables()
 
 
 def _binary_variants(image: np.ndarray) -> list[tuple[str, np.ndarray]]:
@@ -143,6 +187,104 @@ def _extract_codewords(modules: np.ndarray) -> list[int]:
                 value |= 1 << (8 - bit_index)
         codewords.append(value)
     return codewords
+
+
+def _correct_codewords(symbol_size: int, codewords: list[int]) -> tuple[list[int], int, int] | None:
+    capacity = _SYMBOL_CODEWORDS.get(symbol_size)
+    if capacity is None:
+        return None
+    data_count, ecc_count = capacity
+    total_count = data_count + ecc_count
+    if len(codewords) < total_count:
+        return None
+    received = codewords[:total_count]
+    if _rs_is_valid(received, ecc_count):
+        return received[:data_count], 0, ecc_count
+    corrected = _rs_correct(received, ecc_count, max_errors=min(2, ecc_count // 2))
+    if corrected is None:
+        return None
+    errors_corrected = sum(1 for before, after in zip(received, corrected) if before != after)
+    return corrected[:data_count], errors_corrected, ecc_count
+
+
+def _rs_correct(received: list[int], ecc_count: int, max_errors: int) -> list[int] | None:
+    syndromes = _rs_syndromes(received, ecc_count)
+    if not any(syndromes):
+        return received
+    positions = range(len(received))
+    for error_count in range(1, max_errors + 1):
+        for error_positions in combinations(positions, error_count):
+            magnitudes = _solve_error_magnitudes(received, syndromes, error_positions)
+            if magnitudes is None or not any(magnitudes):
+                continue
+            corrected = received.copy()
+            for position, magnitude in zip(error_positions, magnitudes):
+                corrected[position] ^= magnitude
+            if _rs_is_valid(corrected, ecc_count):
+                return corrected
+    return None
+
+
+def _solve_error_magnitudes(received: list[int], syndromes: list[int], error_positions: tuple[int, ...]) -> list[int] | None:
+    size = len(error_positions)
+    codeword_count = len(received)
+    matrix: list[list[int]] = []
+    for row in range(size):
+        syndrome_power = _RS_GENERATOR_BASE + row
+        matrix.append([_gf_pow(syndrome_power * (codeword_count - 1 - position)) for position in error_positions])
+    return _gf_solve(matrix, syndromes[:size])
+
+
+def _rs_is_valid(codewords: list[int], ecc_count: int) -> bool:
+    return not any(_rs_syndromes(codewords, ecc_count))
+
+
+def _rs_syndromes(codewords: list[int], ecc_count: int) -> list[int]:
+    return [_rs_poly_eval(codewords, _gf_pow(_RS_GENERATOR_BASE + index)) for index in range(ecc_count)]
+
+
+def _rs_poly_eval(poly: list[int], x_value: int) -> int:
+    result = 0
+    for coefficient in poly:
+        result = _gf_mul(result, x_value) ^ coefficient
+    return result
+
+
+def _gf_solve(matrix: list[list[int]], values: list[int]) -> list[int] | None:
+    size = len(values)
+    rows = [matrix[row][:] + [values[row]] for row in range(size)]
+    for col in range(size):
+        pivot = next((row for row in range(col, size) if rows[row][col] != 0), None)
+        if pivot is None:
+            return None
+        if pivot != col:
+            rows[col], rows[pivot] = rows[pivot], rows[col]
+        pivot_value = rows[col][col]
+        rows[col] = [_gf_div(value, pivot_value) for value in rows[col]]
+        for row in range(size):
+            if row == col or rows[row][col] == 0:
+                continue
+            factor = rows[row][col]
+            rows[row] = [current ^ _gf_mul(factor, pivot_value) for current, pivot_value in zip(rows[row], rows[col])]
+    return [rows[row][-1] for row in range(size)]
+
+
+def _gf_pow(power: int) -> int:
+    return _GF_EXP[power % 255]
+
+
+def _gf_mul(left: int, right: int) -> int:
+    if left == 0 or right == 0:
+        return 0
+    return _GF_EXP[_GF_LOG[left] + _GF_LOG[right]]
+
+
+def _gf_div(left: int, right: int) -> int:
+    if right == 0:
+        raise ZeroDivisionError("GF division by zero")
+    if left == 0:
+        return 0
+    return _GF_EXP[(_GF_LOG[left] - _GF_LOG[right]) % 255]
 
 
 def _placement(rows: int, cols: int) -> tuple[dict[tuple[int, int], tuple[int, int]], int]:

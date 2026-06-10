@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import time
+
 import numpy as np
 
 import industrial_code_reader.datamatrix.decoder as dm_decoder_module
@@ -102,6 +104,51 @@ def test_native_datamatrix_decoder_reads_generated_ascii_symbol():
     assert results
     assert results[0].text == "DM123"
     assert results[0].quality["backend"] == "native"
+
+
+def test_native_datamatrix_decoder_corrects_single_corrupted_module():
+    import zxingcpp
+
+    barcode = zxingcpp.create_barcode("DM123", zxingcpp.BarcodeFormat.DataMatrix)
+    image = np.array(zxingcpp.write_barcode_to_image(barcode, scale=8))
+    corrupted = image.copy()
+    module = 8
+    symbol_origin = module
+    row = 2
+    col = 4
+    y0 = symbol_origin + row * module
+    x0 = symbol_origin + col * module
+    corrupted[y0 : y0 + module, x0 : x0 + module] = 255 - corrupted[y0 : y0 + module, x0 : x0 + module]
+
+    results = DataMatrixDecoder(method="native").decode(corrupted, DecodeOptions())
+
+    assert results
+    assert results[0].text == "DM123"
+    assert results[0].quality["backend"] == "native"
+    assert results[0].quality["errors_corrected"] >= 1
+
+
+def test_native_datamatrix_decoder_rejects_large_false_symbol_quickly():
+    size = 26
+    cell = 5
+    modules = np.random.default_rng(2).random((size, size)) > 0.5
+    modules[:, 0] = True
+    modules[-1, :] = True
+    modules[0, :] = np.array([index % 2 == 0 for index in range(size)])
+    modules[:, -1] = np.array([index % 2 == 1 for index in range(size)])
+    image = np.full((size * cell, size * cell), 255, dtype=np.uint8)
+    for row in range(size):
+        for col in range(size):
+            if modules[row, col]:
+                image[row * cell : (row + 1) * cell, col * cell : (col + 1) * cell] = 0
+
+    started_at = time.perf_counter()
+    results = DataMatrixDecoder(method="native").decode(image, DecodeOptions(return_failures=True))
+    elapsed = time.perf_counter() - started_at
+
+    assert results
+    assert results[0].text == ""
+    assert elapsed < 2.0
 
 
 def test_native_datamatrix_decoder_reports_failure_for_blank_image():
