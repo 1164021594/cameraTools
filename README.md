@@ -24,6 +24,19 @@ Run the standalone DataMatrix decoder debugger without opening cameras:
 python -m decoder_debugger.main
 ```
 
+Typical DataMatrix debugging flow:
+
+1. Open the debugger with the command above.
+2. In `Preprocess`, click `Open Image`.
+3. Switch `Preview View` between `Original` and `Preprocessed`.
+4. Tune preprocessing operators or select a built-in `Scene`.
+5. In `Find / Decode`, click `Find Code`.
+6. Select `Decoder Method`: `Auto`, `Native`, or `ZXing`.
+7. Click `Decode All Candidate ROIs`.
+8. Read decoded content under `Decoded Text` in the inspector.
+
+Full operation notes are in [`docs/software-operation-guide.md`](docs/software-operation-guide.md).
+
 ## Basic Workflow
 
 1. Click `Scan Cameras` to enumerate readable USB camera indexes.
@@ -44,7 +57,7 @@ Single-camera mode can also capture and calibrate one camera. Single-camera imag
 
 `2D Measurement` uses the monocular `K` and `D` from `mono_calib.npz`. The `Plane distance mm` value is the vertical working distance from the camera to the measured plane. This mode assumes the measured plane is parallel to the camera image plane; tilt compensation is not included yet.
 
-`Barcode Detection` uses `zxing-cpp`. If this mode reports that the dependency is missing, run `python -m pip install -r requirements.txt`. For stable decoding, select the expected barcode type instead of `All` when possible, keep the barcode in focus, avoid overexposure, and make sure the smallest bars/modules occupy several pixels.
+`Barcode Detection` in the main camera GUI still uses the barcode backend configured for that view. The standalone DataMatrix debugger supports selectable DataMatrix methods: `Auto`, `Native`, and `ZXing`. If `ZXing` reports that the dependency is missing, run `python -m pip install -r requirements.txt`. For stable decoding, select the expected barcode type instead of `All` when possible, keep the barcode in focus, avoid overexposure, and make sure the smallest bars/modules occupy several pixels.
 
 ## Calibration Board
 
@@ -79,3 +92,4 @@ Current saved image set status:
 
 Camera stability notes are recorded in [`docs/camera-troubleshooting.md`](docs/camera-troubleshooting.md).
 Calibration, depth estimation, disparity parameters, ROI display, and Raw/Filtered preview behavior are documented in [`docs/stereo-calibration-depth-notes.md`](docs/stereo-calibration-depth-notes.md).
+Current software operation notes are documented in [`docs/software-operation-guide.md`](docs/software-operation-guide.md).
